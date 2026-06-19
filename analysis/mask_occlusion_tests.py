@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataset_loaders import DATASET_CHOICES, load_dataset, resolve_dataset, sample_dataset
-from filters import filters
+from filter_loader import load_filter_bank
 from iris import (
     IrisClassifier,
     build_valid_source_mask,
@@ -25,6 +25,9 @@ from iris import (
     hamming_distances,
     predict_unet_masks,
 )
+
+
+filters, _ = load_filter_bank(None)
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "mask_occlusion_tests"
@@ -68,8 +71,6 @@ def get_source_debug(image):
         iris_mask,
         pupil_mask,
         eyelash_mask,
-        source_image=gray,
-        oversat_threshold=254,
     )
     annulus = ((iris_mask > 0) & ~(pupil_mask > 0))
     valid = valid_mask > 0
@@ -101,7 +102,7 @@ def build_enlarged_mask(mask, kernel_size, iterations):
 def apply_synthetic_occlusion(iris_band, original_mask, enlarged_mask, fill_mode):
     occluded = iris_band.copy()
     newly_masked = (original_mask == 255) & (enlarged_mask != 255)
-    if not np.any(newly_masked):
+    if fill_mode == "none" or not np.any(newly_masked):
         return occluded
 
     if fill_mode == "zero":
@@ -305,8 +306,8 @@ def run_single(args):
         f"{baseline['score']:.6f} / {mask_only['score']:.6f} / {occluded['score']:.6f}"
     )
     print(
-        "Fill mode options: zero=fill with black (0), white=fill with white (255), "
-        "mean=fill with the mean valid iris intensity."
+        "Fill mode options: none=do not overwrite pixels, zero=fill with black (0), "
+        "white=fill with white (255), mean=fill with the mean valid iris intensity."
     )
     print(f"Saved overlay preview to: {overlay_path}")
 
@@ -396,9 +397,9 @@ def build_parser():
     )
     single.add_argument(
         "--fill-mode",
-        choices=["zero", "white", "mean"],
-        default="zero",
-        help="How to overwrite newly masked pixels for test 2: zero=0, white=255, mean=mean valid intensity.",
+        choices=["none", "zero", "white", "mean"],
+        default="none",
+        help="How to overwrite newly masked pixels for test 2. none only changes the mask.",
     )
     single.set_defaults(func=run_single)
 
@@ -419,9 +420,10 @@ def build_parser():
     multiple.add_argument("--kernel-size", type=int, default=17, help="Odd dilation kernel size in pixels.")
     multiple.add_argument("--iterations", type=int, default=1, help="Number of dilation iterations.")
     multiple.add_argument("--max-samples", type=int, default=None, help="Optional cap on total sampled images.")
-    multiple.add_argument("--max-identities", type=int, default=10, help="Optional cap on sampled identities.")
+    multiple.add_argument("--max-id", dest="max_identities", type=int, default=10, help="Optional cap on sampled identities.")
     multiple.add_argument(
-        "--max-images-per-identity",
+        "--max-img-per-id",
+        dest="max_images_per_identity",
         type=int,
         default=1,
         help="Optional cap on sampled images per identity.",

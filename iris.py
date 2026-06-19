@@ -4,7 +4,6 @@ import cv2 as cv
 import numpy as np
 import os
 from dataclasses import dataclass
-from profiling import timeit
 from pathlib import Path
 from numpy.lib.stride_tricks import sliding_window_view
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -190,7 +189,8 @@ def build_valid_source_mask(
     if occlusion_mask is not None:
         valid &= ~(np.asarray(occlusion_mask) > 0)
     if source_image is not None:
-        valid &= np.asarray(source_image) < oversat_threshold
+        source = np.asarray(source_image)
+        valid &= source < oversat_threshold
     return dilate_invalid_region(
         valid.astype(np.uint8) * 255,
         annulus_mask.astype(np.uint8) * 255,
@@ -319,15 +319,6 @@ def binary_iris_mask_to_band(
         invalid_dilation_kernel=invalid_dilation_kernel,
         invalid_dilation_iterations=invalid_dilation_iterations,
     )
-DEFAULT_SEGMENTATION_BACKEND = os.environ.get(
-    "SEG_BACKEND",
-    os.environ.get(
-        "IRIS_SEG_BACKEND",
-        os.environ.get("IRIS_SEGMENTATION_BACKEND", "onnx"),
-    ),
-).strip().lower()
-
-
 def _resolve_segmentation_model_path():
     configured = os.environ.get(
         "SEG_PATH",
@@ -361,15 +352,10 @@ def _resolve_segmentation_model_path():
     return default_candidates[0]
 
 
-def _normalize_segmentation_backend_name(name):
-    backend_name = str(name).strip().lower()
-    if backend_name in {"onnx", "model", "custom", "unet"}:
-        return "onnx"
-    raise ValueError(f"Unsupported segmentation backend: {name}")
-
-
 def get_segmentation_backend_name(backend=None):
-    return _normalize_segmentation_backend_name(backend or DEFAULT_SEGMENTATION_BACKEND)
+    if backend is not None:
+        return str(backend)
+    return "sam-iris" if _is_sam_segmentation_path() else "onnx"
 
 
 UNET_ONNX_PATH = _resolve_segmentation_model_path()
@@ -383,8 +369,13 @@ UNET_BAND_SHAPE = (
     int(os.environ.get("IRIS_UNET_BAND_WIDTH", DEFAULT_BAND_SHAPE[1])),
 )
 _UNET_NET = None
+_SAM_PREDICTOR = None
 
-@timeit
+
+def _is_sam_segmentation_path(path=None):
+    path = UNET_ONNX_PATH if path is None else Path(path)
+    return path.suffix.lower() in {".pt", ".pth"}
+
 def hamming_distance(a,b,mask1, mask2):
     diff = np.bitwise_xor(a,b)
     mask = np.bitwise_and(mask1, mask2)
@@ -394,7 +385,6 @@ def hamming_distance(a,b,mask1, mask2):
         return 2.0
     return total/n
 
-@timeit
 def hamming_distances(a, b, masks_a, mask_b):
     diff = np.bitwise_xor(a, b)
     mask = np.bitwise_and(masks_a, mask_b)
@@ -406,8 +396,7 @@ def hamming_distances(a, b, masks_a, mask_b):
     return scores
 
 
-@timeit
-def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma, rotate_envelope=False):
+def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma, rotate_envelope=True):
     """Create a complex Gabor kernel."""
     y_size, x_size = size
     x_half_size = x_size // 2
@@ -428,7 +417,6 @@ def complex_gabor_kernel(size, sigma, theta, lambd, psi, gamma, rotate_envelope=
     gabor = gaussian * complex_sinusoid
     return gabor
 
-@timeit
 def complex_to_bits(z, mask_bit_list):
     real = (z.real >= 0).astype(np.bool)
     imag = (z.imag >= 0).astype(np.bool)
@@ -536,6 +524,10 @@ def _get_unet_net():
     global _UNET_NET
     if _UNET_NET is not None:
         return _UNET_NET
+    if _is_sam_segmentation_path():
+        raise ValueError(
+            f"SEG_PATH points to a SAM/Iris-SAM PyTorch checkpoint, not ONNX: {UNET_ONNX_PATH}"
+        )
     if not UNET_ONNX_PATH.exists():
         raise FileNotFoundError(
             f"Segmentation ONNX model not found at '{UNET_ONNX_PATH}'. "
@@ -552,6 +544,82 @@ def _get_unet_net():
         net.setPreferableTarget(target)
     _UNET_NET = net
     return net
+
+
+def _resolve_sam_device(torch_module):
+    configured = os.environ.get("IRIS_SAM_DEVICE", "auto").strip().lower()
+    if configured and configured != "auto":
+        return configured
+    if torch_module.cuda.is_available():
+        return "cuda"
+    if hasattr(torch_module.backends, "mps") and torch_module.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _get_sam_predictor():
+    global _SAM_PREDICTOR
+    if _SAM_PREDICTOR is not None:
+        return _SAM_PREDICTOR
+    if not UNET_ONNX_PATH.exists():
+        raise FileNotFoundError(
+            f"Iris-SAM checkpoint not found at '{UNET_ONNX_PATH}'. "
+            "Set SEG_PATH to the downloaded Iris-SAM model.pt checkpoint."
+        )
+    try:
+        import torch
+        from segment_anything import SamPredictor, sam_model_registry
+    except ImportError as exc:
+        raise ImportError(
+            "Iris-SAM needs PyTorch and Meta's segment-anything package. Install with: "
+            "python3 -m pip install git+https://github.com/facebookresearch/segment-anything.git"
+        ) from exc
+
+    model_type = os.environ.get("IRIS_SAM_MODEL_TYPE", "vit_h").strip()
+    if model_type not in sam_model_registry:
+        available = ", ".join(sorted(sam_model_registry))
+        raise ValueError(f"Unknown IRIS_SAM_MODEL_TYPE={model_type!r}. Available: {available}")
+    device = _resolve_sam_device(torch)
+    model = sam_model_registry[model_type](checkpoint=None)
+    checkpoint = torch.load(str(UNET_ONNX_PATH), map_location="cpu")
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        checkpoint = checkpoint["model"]
+    model.load_state_dict(checkpoint)
+    model.to(device=device)
+    model.eval()
+    _SAM_PREDICTOR = SamPredictor(model)
+    return _SAM_PREDICTOR
+
+
+def _sam_prompt_box(image_shape):
+    image_h, image_w = image_shape[:2]
+    scale = float(os.environ.get("IRIS_SAM_BOX_SCALE", 1.0))
+    scale = min(max(scale, 0.05), 1.0)
+    box_w = image_w * scale
+    box_h = image_h * scale
+    x1 = max(0.0, (image_w - box_w) / 2.0)
+    y1 = max(0.0, (image_h - box_h) / 2.0)
+    x2 = min(float(image_w - 1), x1 + box_w - 1.0)
+    y2 = min(float(image_h - 1), y1 + box_h - 1.0)
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def _predict_sam_iris_annulus_mask(img):
+    source_gray = _prepare_segmentation_gray(img)
+    if img.ndim == 2:
+        rgb = cv.cvtColor(img, cv.COLOR_GRAY2RGB)
+    else:
+        rgb = cv.cvtColor(img, cv.COLOR_BGR2RGB)
+
+    predictor = _get_sam_predictor()
+    predictor.set_image(rgb)
+    masks, _scores, _logits = predictor.predict(
+        point_coords=None,
+        point_labels=None,
+        box=_sam_prompt_box(rgb.shape),
+        multimask_output=False,
+    )
+    return source_gray, masks[0].astype(bool)
 
 
 def _sigmoid_if_needed(output):
@@ -579,8 +647,28 @@ def _forward_segmentation_model(img):
 
 
 def predict_unet_masks(img):
+    if _is_sam_segmentation_path():
+        source_gray, annulus_mask = _predict_sam_iris_annulus_mask(img)
+        pupil_mask = _infer_pupil_mask_from_binary_iris(annulus_mask)
+        iris_mask = clean_component_mask((annulus_mask.astype(bool) | pupil_mask.astype(bool)).astype(np.uint8))
+        eyelash_mask = np.zeros_like(iris_mask, dtype=bool)
+        return source_gray, iris_mask.astype(bool), pupil_mask.astype(bool), eyelash_mask
+
     source_gray, output = _forward_segmentation_model(img)
-    if output.ndim != 4 or output.shape[1] < 3:
+    if output.ndim != 4:
+        raise RuntimeError(f"Unexpected segmentation output shape: {output.shape}")
+
+    if output.shape[1] == 1:
+        probability = _sigmoid_if_needed(output[0, 0])
+        image_h, image_w = source_gray.shape
+        resized_probability = cv.resize(probability, (image_w, image_h), interpolation=cv.INTER_LINEAR)
+        annulus_mask = resized_probability >= UNET_THRESHOLD
+        pupil_mask = _infer_pupil_mask_from_binary_iris(annulus_mask)
+        iris_mask = clean_component_mask((annulus_mask.astype(bool) | pupil_mask.astype(bool)).astype(np.uint8))
+        eyelash_mask = np.zeros_like(iris_mask, dtype=bool)
+        return source_gray, iris_mask.astype(bool), pupil_mask.astype(bool), eyelash_mask
+
+    if output.shape[1] < 3:
         raise RuntimeError(f"Unexpected multiclass segmentation output shape: {output.shape}")
 
     probabilities = _sigmoid_if_needed(output[0])
@@ -601,6 +689,9 @@ def predict_unet_masks(img):
 
 
 def predict_binary_iris_mask(img):
+    if _is_sam_segmentation_path():
+        return _predict_sam_iris_annulus_mask(img)
+
     source_gray, output = _forward_segmentation_model(img)
     if output.ndim != 4 or output.shape[1] != 1:
         raise RuntimeError(f"Unexpected binary segmentation output shape: {output.shape}")
@@ -612,8 +703,16 @@ def predict_binary_iris_mask(img):
     return source_gray, iris_mask
 
 
-@timeit
 def _segment_with_unet(img):
+    if _is_sam_segmentation_path():
+        source_gray, annulus_mask = _predict_sam_iris_annulus_mask(img)
+        return binary_iris_mask_to_band(
+            source_gray,
+            annulus_mask,
+            band_shape=UNET_BAND_SHAPE,
+            prefer_ellipse=True,
+        )
+
     source_gray, output = _forward_segmentation_model(img)
     if output.ndim != 4:
         raise RuntimeError(f"Unexpected segmentation output shape: {output.shape}")
@@ -654,7 +753,6 @@ def _segment_with_unet(img):
     )
 
 
-@timeit
 def get_iris_band(img, backend=None):
     get_segmentation_backend_name(backend)
     return _segment_with_unet(img)
@@ -663,7 +761,6 @@ class IrisClassifier():
     def __init__(self, filters) -> None:
         self.init_filters(filters)
         
-    @timeit
     def init_filters(self, filters):
         self._filters = [] 
         for filter_settings in filters:
@@ -675,7 +772,6 @@ class IrisClassifier():
             self._filters.append((real_filter, imag_filter))
         self._filter_settings = filters
 
-    @timeit
     def __call__(self, iris1, iris2, mask1, mask2, rotation=6, offset=0):
         bits_1, mask_1, _ = self.get_iris_code(iris1, mask1)
         return self.compare_iris_code_and_iris(iris2, bits_1, mask2, mask_1, rotation=rotation, offset=offset)
@@ -720,17 +816,14 @@ class IrisClassifier():
         mask_bits = np.concatenate(mask_chunks, axis=1)
         return bits, mask_bits, filters
 
-    @timeit
     def get_iris_code(self, iris, mask=None, offset=0):
         bits, mask_bits, filters = self._encode_iris_offsets(iris, mask, offsets=(offset,))
         return bits[0], mask_bits[0], filters[0]
 
-    @timeit
     def get_iris_codes(self, iris, mask=None, offsets=(0,)):
         bits, mask_bits, filters = self._encode_iris_offsets(iris, mask, offsets=offsets)
         return bits, mask_bits, filters
     
-    @timeit
     def compare_iris_code_and_iris(self, iris, iris_code, iris_mask, iris_code_mask, rotation=None, offset=0):
         if rotation is None:
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=offset)

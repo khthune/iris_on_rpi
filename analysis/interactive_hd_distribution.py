@@ -1,9 +1,56 @@
 from argparse import ArgumentParser
+from itertools import combinations
 from pathlib import Path
 import os
 import sys
+import time
+
+ANALYSIS_ROOT = Path(__file__).resolve().parent
+MATPLOTLIB_CONFIG_DIR = ANALYSIS_ROOT / "output" / "interactive_hd_distribution" / "matplotlib"
+MATPLOTLIB_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CONFIG_DIR))
+os.environ.setdefault("XDG_CACHE_HOME", str(MATPLOTLIB_CONFIG_DIR / "xdg"))
 
 import cv2 as cv
+import matplotlib
+
+
+NON_INTERACTIVE_BACKENDS = {"agg", "pdf", "ps", "svg", "template", "cairo"}
+
+
+def requested_backend_from_args():
+    for index, arg in enumerate(sys.argv):
+        if arg == "--backend" and index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+        if arg.startswith("--backend="):
+            return arg.split("=", 1)[1]
+    return os.environ.get("INTERACTIVE_HD_BACKEND")
+
+
+def backend_is_non_interactive(name):
+    backend = str(name).lower()
+    return any(non_interactive in backend for non_interactive in NON_INTERACTIVE_BACKENDS)
+
+
+def configure_interactive_backend():
+    requested_backend = requested_backend_from_args()
+    if requested_backend:
+        matplotlib.use(requested_backend, force=True)
+        return
+
+    if not backend_is_non_interactive(matplotlib.get_backend()):
+        return
+
+    candidates = ["MacOSX", "TkAgg", "QtAgg"] if sys.platform == "darwin" else ["TkAgg", "QtAgg"]
+    for backend in candidates:
+        try:
+            matplotlib.use(backend, force=True)
+            return
+        except Exception:
+            continue
+
+
+configure_interactive_backend()
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
@@ -12,7 +59,6 @@ import seaborn as sns
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-ANALYSIS_ROOT = Path(__file__).resolve().parent
 if str(ANALYSIS_ROOT) not in sys.path:
     sys.path.insert(0, str(ANALYSIS_ROOT))
 
@@ -26,9 +72,14 @@ from pairwise_iris_analysis import (
     precompute_codes,
     summarize_label_pairs,
 )
+from rotation_part_scoring import part_scores_for_offsets, select_parts, split_code_slices
 
 
 DEFAULT_OUTPUT_DIR = ANALYSIS_ROOT / "output" / "interactive_hd_distribution"
+
+
+def is_interactive_backend():
+    return not backend_is_non_interactive(plt.get_backend())
 
 
 def add_figure_metadata(figure, metadata):
@@ -84,7 +135,76 @@ def load_pairwise_npz(path):
     dataset_path = scalar_from_npz(data["dataset_path"], None) if "dataset_path" in data.files else None
     rotation = scalar_from_npz(data["rotation"], None) if "rotation" in data.files else None
     matcher = scalar_from_npz(data["matcher"], MATCHER_IRISCODE) if "matcher" in data.files else MATCHER_IRISCODE
-    return pairwise, labels, image_names, dataset_path, rotation, matcher
+    parts = scalar_from_npz(data["parts"], None) if "parts" in data.files else None
+    if parts is not None:
+        parts = int(parts)
+        if parts < 1:
+            parts = None
+    return pairwise, labels, image_names, dataset_path, rotation, matcher, parts
+
+
+def compute_pairwise_scores_parts(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets, parts):
+    slices = split_code_slices(base_codes.shape[1], parts)
+    idx1_list = []
+    idx2_list = []
+    score_list = []
+    same_class_list = []
+    best_offset_list = []
+    direction_list = []
+
+    pair_count = len(labels) * (len(labels) - 1) // 2
+    started = time.perf_counter()
+
+    for pair_index, (idx1, idx2) in enumerate(combinations(range(len(labels)), 2), start=1):
+        scores_12, offsets_12 = part_scores_for_offsets(
+            base_codes[idx1],
+            base_masks[idx1],
+            rotated_codes[idx2],
+            rotated_masks[idx2],
+            offsets,
+            slices,
+            min_valid_bits=1,
+        )
+        scores_21, offsets_21 = part_scores_for_offsets(
+            base_codes[idx2],
+            base_masks[idx2],
+            rotated_codes[idx1],
+            rotated_masks[idx1],
+            offsets,
+            slices,
+            min_valid_bits=1,
+        )
+        result_12 = select_parts(scores_12, offsets_12, eliminate=0)
+        result_21 = select_parts(scores_21, offsets_21, eliminate=0)
+
+        if result_12["avg_hd"] <= result_21["avg_hd"]:
+            best_score = result_12["avg_hd"]
+            best_offset = result_12["anchor_offset"]
+            direction = 1
+        else:
+            best_score = result_21["avg_hd"]
+            best_offset = result_21["anchor_offset"]
+            direction = -1
+
+        idx1_list.append(idx1)
+        idx2_list.append(idx2)
+        score_list.append(best_score)
+        same_class_list.append(labels[idx1] == labels[idx2])
+        best_offset_list.append(best_offset)
+        direction_list.append(direction)
+
+        if pair_index == 1 or pair_index % 25000 == 0 or pair_index == pair_count:
+            elapsed = time.perf_counter() - started
+            print(f"Scored part-based pairs: {pair_index}/{pair_count} in {elapsed:.1f}s")
+
+    return {
+        "idx1": np.array(idx1_list, dtype=np.int32),
+        "idx2": np.array(idx2_list, dtype=np.int32),
+        "scores": np.array(score_list, dtype=np.float32),
+        "same_class": np.array(same_class_list, dtype=bool),
+        "best_offset": np.array(best_offset_list, dtype=np.int16),
+        "direction": np.array(direction_list, dtype=np.int8),
+    }
 
 
 def compute_pairwise(args):
@@ -127,14 +247,25 @@ def compute_pairwise(args):
     if summary["mated_pairs"] == 0 or summary["non_mated_pairs"] == 0:
         raise ValueError("After segmentation failures, the subset needs both mated and non-mated pairs.")
 
-    pairwise = compute_pairwise_scores_iriscode(
-        labels,
-        base_codes,
-        base_masks,
-        rotated_codes,
-        rotated_masks,
-        offsets,
-    )
+    if args.parts is None:
+        pairwise = compute_pairwise_scores_iriscode(
+            labels,
+            base_codes,
+            base_masks,
+            rotated_codes,
+            rotated_masks,
+            offsets,
+        )
+    else:
+        pairwise = compute_pairwise_scores_parts(
+            labels,
+            base_codes,
+            base_masks,
+            rotated_codes,
+            rotated_masks,
+            offsets,
+            args.parts,
+        )
     return pairwise, labels, image_names, str(dataset_path), args.rotation, MATCHER_IRISCODE, dataset_format
 
 
@@ -144,7 +275,7 @@ def output_paths(output_dir, dataset_format, output_name):
     return base_dir / f"{clean_name}.png", base_dir / f"{clean_name}_scores.npz"
 
 
-def save_pairwise_cache(output_path, pairwise, labels, image_names, dataset_path, rotation, matcher):
+def save_pairwise_cache(output_path, pairwise, labels, image_names, dataset_path, rotation, matcher, parts=None):
     idx1 = pairwise["idx1"]
     idx2 = pairwise["idx2"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +294,7 @@ def save_pairwise_cache(output_path, pairwise, labels, image_names, dataset_path
         dataset_path=np.array(str(Path(dataset_path).expanduser().resolve())),
         rotation=np.array(rotation),
         matcher=np.array(matcher),
+        parts=np.array(-1 if parts is None else int(parts)),
     )
     return output_path
 
@@ -210,6 +342,7 @@ class InteractiveDistribution:
         selection_width,
         show_pairs,
         figure_output_path,
+        scale="linear",
         click_output_dir=None,
     ):
         self.pairwise = pairwise
@@ -220,6 +353,7 @@ class InteractiveDistribution:
         self.selection_width = float(selection_width)
         self.show_pairs = int(show_pairs)
         self.figure_output_path = Path(figure_output_path).expanduser().resolve()
+        self.scale = str(scale)
         self.mode = "all"
         self.overlay_cache = MaskOverlayCache(self.dataset_path)
         self.click_output_dir = Path(click_output_dir).expanduser().resolve() if click_output_dir else None
@@ -259,11 +393,32 @@ class InteractiveDistribution:
         self.figure, axis = plt.subplots(figsize=(13, 7))
         self.distribution_axis = axis
 
-        sns.kdeplot(mated_scores, ax=axis, label="Mated", color="#3b5bff", fill=True, alpha=0.55)
-        sns.kdeplot(non_mated_scores, ax=axis, label="Non-Mated", color="#ff4d4f", fill=True, alpha=0.55)
+        if self.scale == "log":
+            bins = np.linspace(0.0, 0.6, 80)
+            axis.hist(
+                mated_scores,
+                bins=bins,
+                label="Mated",
+                color="#3b5bff",
+                alpha=0.45,
+                log=True,
+            )
+            axis.hist(
+                non_mated_scores,
+                bins=bins,
+                label="Non-Mated",
+                color="#ff4d4f",
+                alpha=0.45,
+                log=True,
+            )
+            axis.set_ylabel("Pair Count (log scale)")
+            axis.set_ylim(bottom=0.8)
+        else:
+            sns.kdeplot(mated_scores, ax=axis, label="Mated", color="#3b5bff", fill=True, alpha=0.55)
+            sns.kdeplot(non_mated_scores, ax=axis, label="Non-Mated", color="#ff4d4f", fill=True, alpha=0.55)
+            axis.set_ylabel("Density")
         axis.set_title("Hamming Distance Distribution")
         axis.set_xlabel("Hamming Distance")
-        axis.set_ylabel("Density")
         axis.set_xlim(0.0, 0.6)
         axis.legend(loc="upper right")
 
@@ -277,7 +432,15 @@ class InteractiveDistribution:
 
         self.figure.canvas.mpl_connect("button_press_event", self.on_click)
         self.figure.canvas.mpl_connect("key_press_event", self.on_key)
-        plt.show()
+        if is_interactive_backend():
+            plt.show()
+        else:
+            print(
+                "Interactive window was not opened because Matplotlib is using "
+                f"the non-interactive backend '{plt.get_backend()}'. "
+                "Run from a GUI-capable terminal, or add '--backend MacOSX' on macOS. "
+                "Other options are '--backend TkAgg' or setting INTERACTIVE_HD_BACKEND=MacOSX."
+            )
 
     def on_key(self, event):
         if event.key == "m":
@@ -389,7 +552,10 @@ class InteractiveDistribution:
             output = self.click_output_dir / f"selection_{self.click_count:03d}_hd_{target_hd:.4f}.png"
             fig.savefig(output, dpi=180, bbox_inches="tight")
             print(f"Saved clicked selection to {output}")
-        plt.show(block=False)
+        if is_interactive_backend():
+            plt.show(block=False)
+        else:
+            print(f"Detail view was created but cannot be shown with backend '{plt.get_backend()}'.")
 
 
 def parse_args():
@@ -403,38 +569,70 @@ def parse_args():
     parser.add_argument("--dataset", default="auto", choices=DATASET_CHOICES, help="Dataset format to compute.")
     parser.add_argument("--dataset-path", default=None, help="Dataset root. Required when --scores lacks dataset_path.")
     parser.add_argument("--rotation", type=int, default=21, help="Rotation count used when computing scores.")
-    parser.add_argument("--filters", default=None, help="Optional Python filters file containing a 'filters' list.")
+    parser.add_argument(
+        "--filters",
+        dest="filters",
+        default=None,
+        help="Optional Python filters file containing a 'filters' list.",
+    )
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--max-identities", type=int, default=None)
-    parser.add_argument("--max-img-per-id", "--max-images-per-identity", dest="max_images_per_identity", type=int, default=20)
+    parser.add_argument("--max-id", dest="max_identities", type=int, default=None)
+    parser.add_argument("--max-img-per-id", dest="max_images_per_identity", type=int, default=20)
+    parser.add_argument(
+        "--parts",
+        type=int,
+        default=None,
+        help="Split the iriscode into this many parts and score pairs by average per-part best HD.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--selection-width", type=float, default=0.005, help="HD half-window around the clicked x-value.")
     parser.add_argument("--show-pairs", type=int, default=4, help="Maximum pairs to show per click.")
     parser.add_argument("--click-output-dir", default=None, help="Optional directory to save every clicked detail view.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for saved HD plots and score caches.")
     parser.add_argument("--output-name", default="interactive_hd_distribution", help="Name shown in plot metadata.")
+    parser.add_argument(
+        "--backend",
+        default=None,
+        help="Matplotlib backend for the interactive window, for example MacOSX or TkAgg.",
+    )
+    parser.add_argument(
+        "--scale",
+        choices=["linear", "log"],
+        default="linear",
+        help="HD distribution scale. Use log for a logarithmic count histogram.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    print(f"Matplotlib backend: {plt.get_backend()}")
     if args.rotation < 1:
         raise ValueError("--rotation must be at least 1")
     if args.show_pairs < 1:
         raise ValueError("--show-pairs must be at least 1")
     if args.selection_width <= 0:
         raise ValueError("--selection-width must be positive")
+    if args.parts is not None and args.parts < 1:
+        raise ValueError("--parts must be at least 1")
 
     if args.scores:
-        pairwise, labels, image_names, saved_dataset_path, rotation, matcher = load_pairwise_npz(args.scores)
+        pairwise, labels, image_names, saved_dataset_path, rotation, matcher, cached_parts = load_pairwise_npz(args.scores)
+        if args.parts is not None and cached_parts != args.parts:
+            raise ValueError(
+                "--parts cannot change an existing score cache. "
+                "Recompute without --scores, or use a cache generated with the same --parts value."
+            )
         dataset_path = args.dataset_path or saved_dataset_path
         if dataset_path is None:
             raise ValueError("--dataset-path is required because the .npz does not contain dataset_path.")
         dataset_format = args.dataset
         rotation = args.rotation if rotation is None else rotation
+        parts = cached_parts
         save_cache = False
     else:
         pairwise, labels, image_names, dataset_path, rotation, matcher, dataset_format = compute_pairwise(args)
+        parts = args.parts
         save_cache = True
 
     figure_output_path, score_cache_path = output_paths(args.output_dir, dataset_format, args.output_name)
@@ -447,6 +645,7 @@ def main():
             dataset_path,
             rotation,
             matcher,
+            parts,
         )
         print(f"Saved interactive score cache to {saved_cache}")
 
@@ -457,7 +656,9 @@ def main():
         "segmentation_backend": get_segmentation_backend_name(),
         "matcher": matcher,
         "rotation": rotation,
+        "parts": parts,
         "selection_width": args.selection_width,
+        "scale": args.scale,
         "output_name": args.output_name,
         "samples": len(image_names),
         "pairs": len(pairwise["scores"]),
@@ -471,6 +672,7 @@ def main():
         selection_width=args.selection_width,
         show_pairs=args.show_pairs,
         figure_output_path=figure_output_path,
+        scale=args.scale,
         click_output_dir=args.click_output_dir,
     )
     viewer.plot()

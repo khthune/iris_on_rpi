@@ -1,3 +1,12 @@
 click
+h5py
+matplotlib
 numpy
+onnx
 opencv-contrib-python
+scikit-learn
+scipy
+seaborn
+segmentation-models-pytorch
+torch
+torchvision

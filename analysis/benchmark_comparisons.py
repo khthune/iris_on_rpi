@@ -12,8 +12,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from filters import filters
+from filter_loader import load_filter_bank
 from iris import IrisClassifier, get_iris_band, hamming_distance
+
+
+filters, _ = load_filter_bank(None)
 
 
 def parse_rotation(value):

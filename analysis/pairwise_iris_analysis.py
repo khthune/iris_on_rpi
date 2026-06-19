@@ -7,18 +7,31 @@ from pathlib import Path
 import sys
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
 from sklearn.metrics import auc, roc_curve
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+ANALYSIS_ROOT = Path(__file__).resolve().parent
+MATPLOTLIB_CONFIG_DIR = ANALYSIS_ROOT / "output" / "pairwise_iris_analysis" / "matplotlib"
+MATPLOTLIB_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CONFIG_DIR))
+XDG_CACHE_DIR = ANALYSIS_ROOT / "output" / "pairwise_iris_analysis" / "cache"
+XDG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("XDG_CACHE_HOME", str(XDG_CACHE_DIR))
 
 from dataset_loaders import DATASET_CHOICES, dataset_output_slug, load_dataset, resolve_dataset, sample_dataset
 from filter_loader import load_filter_bank
 from iris import IrisClassifier, get_iris_band
+from rotation_part_scoring import compute_pairwise_rotation_classifier
+
+import matplotlib
+
+if matplotlib.get_backend().lower() == "agg" or __name__ == "__main__":
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 DEFAULT_DATASET_FORMAT = "auto"
@@ -34,8 +47,15 @@ def add_figure_metadata(figure, metadata):
         figure.text(0.01, 0.01, text, ha="left", va="bottom", fontsize=7, family="monospace", wrap=True)
 
 
-def precompute_codes(images, labels, image_names, classifier, rotation):
-    offsets = np.arange(rotation) - rotation // 2
+def precompute_codes(images, labels, image_names, classifier, rotation, band_getter=None, offsets=None):
+    if band_getter is None:
+        band_getter = lambda image, _image_name: get_iris_band(image)
+    if offsets is None:
+        offsets = np.arange(rotation) - rotation // 2
+    else:
+        offsets = np.asarray(offsets, dtype=np.int64)
+        if offsets.size == 0:
+            raise ValueError("offsets cannot be empty")
     sample_count = len(images)
 
     base_codes = []
@@ -46,11 +66,11 @@ def precompute_codes(images, labels, image_names, classifier, rotation):
     kept_image_names = []
     skipped = []
     for index, image in enumerate(images, start=1):
-        if index == 1 or index % 100 == 0 or index == sample_count:
+        if index == 1 or index % 250 == 0 or index == sample_count:
             print(f"Precomputing iris codes: {index}/{sample_count}")
 
         try:
-            iris_band, iris_mask = get_iris_band(image)
+            iris_band, iris_mask = band_getter(image, image_names[index - 1])
         except Exception as exc:
             skipped.append((index - 1, str(image_names[index - 1]), str(exc)))
             continue
@@ -144,7 +164,7 @@ def compute_pairwise_scores_iriscode(labels, base_codes, base_masks, rotated_cod
         best_offset_list.append(best_offset)
         direction_list.append(direction)
 
-        if pair_index == 1 or pair_index % 5000 == 0 or pair_index == pair_count:
+        if pair_index == 1 or pair_index % 25000 == 0 or pair_index == pair_count:
             elapsed = time.perf_counter() - started
             print(f"Scored pairs: {pair_index}/{pair_count} in {elapsed:.1f}s")
 
@@ -179,61 +199,205 @@ def summarize_label_pairs(labels):
 
 
 def evaluate_scores(same_class, scores):
+    same_class = np.asarray(same_class, dtype=bool)
     fpr, tpr, thresholds = roc_curve(same_class, -scores)
     fnr = 1.0 - tpr
     eer_index = int(np.nanargmin(np.abs(fnr - fpr)))
     eer = float((fpr[eer_index] + fnr[eer_index]) / 2.0)
     roc_auc = float(auc(fpr, tpr))
+    mated_total = int(np.sum(same_class))
+    non_mated_total = int(np.sum(~same_class))
+    eer_fpr = float(fpr[eer_index])
+    eer_fnr = float(fnr[eer_index])
+    fpr_std = 0.0 if non_mated_total == 0 else np.sqrt(eer_fpr * (1.0 - eer_fpr) / non_mated_total)
+    fnr_std = 0.0 if mated_total == 0 else np.sqrt(eer_fnr * (1.0 - eer_fnr) / mated_total)
+    eer_std = float(0.5 * np.sqrt((fpr_std ** 2) + (fnr_std ** 2)))
 
     return {
         "fpr": fpr,
         "tpr": tpr,
         "thresholds": thresholds,
         "eer": eer,
+        "eer_std": eer_std,
+        "eer_fpr": eer_fpr,
+        "eer_fnr": eer_fnr,
         "eer_threshold": float(thresholds[eer_index]),
         "roc_auc": roc_auc,
     }
 
 
-def save_results(output_path, pairwise, evaluation, labels, image_names, dataset_path, rotation, matcher):
-    output = Path(output_path).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
+def evaluate_zero_false_accept_threshold(same_class, scores, lower_is_mated=True):
+    same_class = np.asarray(same_class, dtype=bool)
+    scores = np.asarray(scores, dtype=np.float64)
+    mated_scores = scores[same_class]
+    non_mated_scores = scores[~same_class]
+    if mated_scores.size == 0 or non_mated_scores.size == 0:
+        return {
+            "threshold": None,
+            "boundary_threshold": None,
+            "tpr": None,
+            "genuine_accept_rate": None,
+            "false_reject_rate": None,
+            "false_accept_rate": None,
+            "mated_accepted": 0,
+            "mated_total": int(mated_scores.size),
+            "non_mated_total": int(non_mated_scores.size),
+            "rule": "score <= threshold" if lower_is_mated else "score >= threshold",
+        }
 
-    idx1 = pairwise["idx1"]
-    idx2 = pairwise["idx2"]
+    if lower_is_mated:
+        boundary_threshold = float(np.min(non_mated_scores))
+        threshold = float(np.nextafter(boundary_threshold, -np.inf))
+        accepted_mated = mated_scores <= threshold
+        accepted_non_mated = non_mated_scores <= threshold
+        rule = "score <= threshold"
+    else:
+        boundary_threshold = float(np.max(non_mated_scores))
+        threshold = float(np.nextafter(boundary_threshold, np.inf))
+        accepted_mated = mated_scores >= threshold
+        accepted_non_mated = non_mated_scores >= threshold
+        rule = "score >= threshold"
 
-    np.savez(
-        output,
-        idx1=idx1,
-        idx2=idx2,
-        scores=pairwise["scores"],
-        same_class=pairwise["same_class"],
-        best_offset=pairwise["best_offset"],
-        direction=pairwise["direction"],
-        label1=labels[idx1],
-        label2=labels[idx2],
-        image_name1=image_names[idx1],
-        image_name2=image_names[idx2],
-        fpr=evaluation["fpr"],
-        tpr=evaluation["tpr"],
-        thresholds=evaluation["thresholds"],
-        eer=np.array(evaluation["eer"]),
-        eer_threshold=np.array(evaluation["eer_threshold"]),
-        roc_auc=np.array(evaluation["roc_auc"]),
-        dataset_path=np.array(str(Path(dataset_path).expanduser().resolve())),
-        rotation=np.array(rotation),
-        matcher=np.array(matcher),
-    )
-    return output
+    tpr = float(np.mean(accepted_mated))
+    far = float(np.mean(accepted_non_mated))
+    return {
+        "threshold": threshold,
+        "boundary_threshold": boundary_threshold,
+        "tpr": tpr,
+        "genuine_accept_rate": tpr,
+        "false_reject_rate": float(1.0 - tpr),
+        "false_accept_rate": far,
+        "mated_accepted": int(np.sum(accepted_mated)),
+        "mated_total": int(mated_scores.size),
+        "non_mated_total": int(non_mated_scores.size),
+        "rule": rule,
+    }
 
 
-def plot_results(scores, same_class, evaluation, figure_path=None, matcher=MATCHER_IRISCODE, metadata=None):
+def evaluate_fmr_threshold(same_class, scores, target_fmr, lower_is_mated=True):
+    same_class = np.asarray(same_class, dtype=bool)
+    scores = np.asarray(scores, dtype=np.float64)
+    mated_scores = scores[same_class]
+    non_mated_scores = scores[~same_class]
+    if mated_scores.size == 0 or non_mated_scores.size == 0:
+        return {
+            "threshold": None,
+            "target_fmr": float(target_fmr),
+            "actual_fmr": None,
+            "fnmr": None,
+            "mated_accepted": 0,
+            "mated_total": int(mated_scores.size),
+            "non_mated_accepted": 0,
+            "non_mated_total": int(non_mated_scores.size),
+            "rule": "score <= threshold" if lower_is_mated else "score >= threshold",
+        }
+
+    target_fmr = float(target_fmr)
+    if not 0.0 <= target_fmr <= 1.0:
+        raise ValueError("target_fmr must be between 0 and 1")
+
+    non_mated_total = int(non_mated_scores.size)
+    allowed_false_accepts = int(np.floor(target_fmr * non_mated_total))
+    if lower_is_mated:
+        sorted_non_mated = np.sort(non_mated_scores)
+        if allowed_false_accepts <= 0:
+            threshold = float(np.nextafter(sorted_non_mated[0], -np.inf))
+        elif allowed_false_accepts >= non_mated_total:
+            threshold = float(np.inf)
+        else:
+            threshold = float(np.nextafter(sorted_non_mated[allowed_false_accepts], -np.inf))
+        accepted_mated = mated_scores <= threshold
+        accepted_non_mated = non_mated_scores <= threshold
+        rule = "score <= threshold"
+    else:
+        sorted_non_mated = np.sort(non_mated_scores)[::-1]
+        if allowed_false_accepts <= 0:
+            threshold = float(np.nextafter(sorted_non_mated[0], np.inf))
+        elif allowed_false_accepts >= non_mated_total:
+            threshold = float(-np.inf)
+        else:
+            threshold = float(np.nextafter(sorted_non_mated[allowed_false_accepts], np.inf))
+        accepted_mated = mated_scores >= threshold
+        accepted_non_mated = non_mated_scores >= threshold
+        rule = "score >= threshold"
+
+    non_mated_accepted = int(np.sum(accepted_non_mated))
+    mated_accepted = int(np.sum(accepted_mated))
+    mated_total = int(mated_scores.size)
+
+    return {
+        "threshold": threshold,
+        "target_fmr": target_fmr,
+        "actual_fmr": float(non_mated_accepted / non_mated_total),
+        "fnmr": float(1.0 - (mated_accepted / mated_total)),
+        "mated_accepted": mated_accepted,
+        "mated_total": mated_total,
+        "non_mated_accepted": non_mated_accepted,
+        "non_mated_total": non_mated_total,
+        "allowed_false_accepts": allowed_false_accepts,
+        "rule": rule,
+    }
+
+
+def evaluate_zero_false_reject_threshold(same_class, scores, lower_is_mated=True):
+    same_class = np.asarray(same_class, dtype=bool)
+    scores = np.asarray(scores, dtype=np.float64)
+    mated_scores = scores[same_class]
+    non_mated_scores = scores[~same_class]
+    if mated_scores.size == 0 or non_mated_scores.size == 0:
+        return {
+            "threshold": None,
+            "boundary_threshold": None,
+            "non_mated_rejected_rate": None,
+            "false_accept_rate": None,
+            "false_reject_rate": None,
+            "non_mated_rejected": 0,
+            "mated_total": int(mated_scores.size),
+            "non_mated_total": int(non_mated_scores.size),
+            "rule": "score <= threshold" if lower_is_mated else "score >= threshold",
+        }
+
+    if lower_is_mated:
+        boundary_threshold = float(np.max(mated_scores))
+        threshold = float(np.nextafter(boundary_threshold, np.inf))
+        accepted_mated = mated_scores <= threshold
+        accepted_non_mated = non_mated_scores <= threshold
+        rule = "score <= threshold"
+    else:
+        boundary_threshold = float(np.min(mated_scores))
+        threshold = float(np.nextafter(boundary_threshold, -np.inf))
+        accepted_mated = mated_scores >= threshold
+        accepted_non_mated = non_mated_scores >= threshold
+        rule = "score >= threshold"
+
+    non_mated_rejected = ~accepted_non_mated
+    return {
+        "threshold": threshold,
+        "boundary_threshold": boundary_threshold,
+        "non_mated_rejected_rate": float(np.mean(non_mated_rejected)),
+        "false_accept_rate": float(np.mean(accepted_non_mated)),
+        "false_reject_rate": float(1.0 - np.mean(accepted_mated)),
+        "non_mated_rejected": int(np.sum(non_mated_rejected)),
+        "mated_total": int(mated_scores.size),
+        "non_mated_total": int(non_mated_scores.size),
+        "rule": rule,
+    }
+
+
+def plot_results(
+    scores,
+    same_class,
+    evaluation,
+    zero_false_accept=None,
+    zero_false_reject=None,
+    figure_path=None,
+    matcher=MATCHER_IRISCODE,
+    metadata=None,
+    scale="linear",
+):
     mated_scores = scores[same_class]
     non_mated_scores = scores[~same_class]
     fpr = evaluation["fpr"]
-    positive_fpr = fpr[fpr > 0.0]
-    min_log_fpr = max(float(positive_fpr.min()) / 10.0, 1e-6) if positive_fpr.size else 1e-6
-    plot_fpr = np.maximum(fpr, min_log_fpr)
     distribution_title = "Hamming Distance Distribution"
     x_label = "Hamming Distance"
     x_limit = (0.0, 0.6)
@@ -241,21 +405,70 @@ def plot_results(scores, same_class, evaluation, figure_path=None, matcher=MATCH
     sns.set_theme(style="whitegrid")
     figure, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    sns.kdeplot(mated_scores, ax=axes[0], label="Mated", color="#3b5bff", fill=True, alpha=0.55)
-    sns.kdeplot(
-        non_mated_scores,
-        ax=axes[0],
-        label="Non-Mated",
-        color="#ff4d4f",
-        fill=True,
-        alpha=0.55,
-    )
+    if scale == "log":
+        bins = np.linspace(x_limit[0], x_limit[1], 80)
+        axes[0].hist(
+            mated_scores,
+            bins=bins,
+            label="Mated",
+            color="#3b5bff",
+            alpha=0.45,
+            log=True,
+        )
+        axes[0].hist(
+            non_mated_scores,
+            bins=bins,
+            label="Non-Mated",
+            color="#ff4d4f",
+            alpha=0.45,
+            log=True,
+        )
+    else:
+        sns.kdeplot(mated_scores, ax=axes[0], label="Mated", color="#3b5bff", fill=True, alpha=0.55)
+        sns.kdeplot(
+            non_mated_scores,
+            ax=axes[0],
+            label="Non-Mated",
+            color="#ff4d4f",
+            fill=True,
+            alpha=0.55,
+        )
     axes[0].set_title(distribution_title)
     axes[0].set_xlabel(x_label)
-    axes[0].set_ylabel("Density")
+    if scale == "log":
+        axes[0].set_ylabel("Pair Count (log scale)")
+        axes[0].set_ylim(bottom=0.8)
+    else:
+        axes[0].set_ylabel("Density")
     if x_limit is not None:
         axes[0].set_xlim(*x_limit)
+    if zero_false_accept and zero_false_accept.get("threshold") is not None:
+        axes[0].axvline(
+            zero_false_accept["threshold"],
+            color="#111111",
+            linestyle="--",
+            linewidth=1.4,
+            label=(
+                "Zero false accepts "
+                f"(T={zero_false_accept['threshold']:.4f})"
+            ),
+        )
+    if zero_false_reject and zero_false_reject.get("threshold") is not None:
+        axes[0].axvline(
+            zero_false_reject["threshold"],
+            color="#00897b",
+            linestyle=":",
+            linewidth=1.8,
+            label=(
+                "Zero false rejects "
+                f"(T={zero_false_reject['threshold']:.4f})"
+            ),
+        )
     axes[0].legend(loc="upper right")
+
+    plot_fpr = fpr
+    chance_fpr = np.linspace(0.0, 1.0, 200)
+    x_label_roc = "False Positive Rate"
 
     axes[1].plot(
         plot_fpr,
@@ -264,13 +477,11 @@ def plot_results(scores, same_class, evaluation, figure_path=None, matcher=MATCH
         lw=2,
         label=f"ROC (AUC = {evaluation['roc_auc']:.4f}, EER = {evaluation['eer']:.4f})",
     )
-    chance_fpr = np.logspace(np.log10(min_log_fpr), 0.0, 200)
     axes[1].plot(chance_fpr, chance_fpr, linestyle="--", color="#6c757d", lw=1)
     axes[1].set_title("ROC Curve")
-    axes[1].set_xlabel("False Positive Rate (log scale)")
+    axes[1].set_xlabel(x_label_roc)
     axes[1].set_ylabel("True Positive Rate")
-    axes[1].set_xscale("log")
-    axes[1].set_xlim(min_log_fpr, 1.0)
+    axes[1].set_xlim(0.0, 1.0)
     axes[1].set_ylim(0.0, 1.0)
     axes[1].legend(loc="lower right")
 
@@ -282,13 +493,12 @@ def plot_results(scores, same_class, evaluation, figure_path=None, matcher=MATCH
         output.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(output, dpi=300, bbox_inches="tight")
 
-    if os.environ.get("MPLBACKEND", "").lower() != "agg":
-        plt.show()
+    plt.close(figure)
 
 
 def main():
     parser = ArgumentParser(
-        description="Compute pairwise iris comparison scores, save them to .npz, and plot distribution/ROC/EER."
+        description="Compute pairwise iris comparison scores and plot distribution/ROC/EER."
     )
     parser.add_argument(
         "--dataset-path",
@@ -299,16 +509,6 @@ def main():
         default=DEFAULT_DATASET_FORMAT,
         choices=DATASET_CHOICES,
         help="Dataset folder layout to load",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Optional output .npz file for pairwise scores and metrics. Omit to skip saving scores.",
-    )
-    parser.add_argument(
-        "--figure-output",
-        default=None,
-        help="Output image path for the distribution/ROC figure. Defaults to fltr_ana_<dataset>.png",
     )
     parser.add_argument(
         "--output-name",
@@ -325,24 +525,37 @@ def main():
     )
     parser.add_argument(
         "--filters",
+        dest="filters",
         default=None,
         help="Optional Python filters file containing a 'filters' list. Defaults to project filters.py.",
     )
     parser.add_argument(
-        "--max-samples",
+        "--parts",
         type=int,
         default=None,
-        help="Randomly sample at most this many images before pairwise evaluation.",
+        help="Use part-split average HD with this many iriscode parts. If omitted, use normal whole-iriscode HD.",
     )
     parser.add_argument(
-        "--max-identities",
+        "--eliminate",
+        type=int,
+        default=0,
+        help="For --parts, remove this many parts furthest from the lowest-HD part's rotation. Default: 0.",
+    )
+    parser.add_argument(
+        "--score",
+        choices=["hd"],
+        default="hd",
+        help="Part-split score. Currently only hd is supported here.",
+    )
+    parser.add_argument(
+        "--max-id",
+        dest="max_identities",
         type=int,
         default=None,
         help="Randomly sample at most this many identities.",
     )
     parser.add_argument(
         "--max-img-per-id",
-        "--max-images-per-identity",
         dest="max_images_per_identity",
         type=int,
         default=20,
@@ -354,17 +567,35 @@ def main():
         default=0,
         help="Random seed for deterministic subset sampling.",
     )
+    parser.add_argument(
+        "--scale",
+        choices=["linear", "log"],
+        default="linear",
+        help="HD distribution scale. Use log for a logarithmic count histogram.",
+    )
+    parser.add_argument(
+        "--fmr",
+        type=float,
+        default=1e-4,
+        help="Target false match rate for printing an operating threshold. Default: 1e-4.",
+    )
     args = parser.parse_args()
 
     if args.rotation < 1:
         raise ValueError("--rotation must be at least 1")
-    if args.figure_output and args.output_name:
-        raise ValueError("Use either --figure-output or --output-name, not both.")
+    if not 0.0 <= args.fmr <= 1.0:
+        raise ValueError("--fmr must be between 0 and 1")
+    if args.parts is not None and args.parts < 1:
+        raise ValueError("--parts must be at least 1")
+    if args.eliminate < 0:
+        raise ValueError("--eliminate cannot be negative")
+    if args.parts is not None and args.eliminate >= args.parts:
+        raise ValueError("--eliminate must be smaller than --parts")
 
     dataset_path, dataset_format = resolve_dataset(args.dataset_path, args.dataset_format)
     dataset_name = dataset_output_slug(dataset_format)
-    figure_output = args.figure_output
-    if figure_output is None and args.output_name is not None:
+    figure_output = None
+    if args.output_name is not None:
         output_name = args.output_name
         if Path(output_name).suffix == "":
             output_name = f"{output_name}.png"
@@ -382,7 +613,7 @@ def main():
         images,
         labels,
         image_names,
-        max_samples=args.max_samples,
+        max_samples=None,
         max_identities=args.max_identities,
         max_images_per_identity=args.max_images_per_identity,
         seed=args.seed,
@@ -396,7 +627,7 @@ def main():
     if pre_summary["mated_pairs"] == 0 or pre_summary["non_mated_pairs"] == 0:
         raise ValueError(
             "The sampled subset does not contain both mated and non-mated pairs. "
-            "Use a larger subset and prefer --max-images-per-identity 2 or more."
+            "Use a larger subset and prefer --max-img-per-id 2 or more."
         )
     selected_filters, filters_source = load_filter_bank(args.filters)
     print(f"Filters in use: {len(selected_filters)}")
@@ -435,31 +666,85 @@ def main():
         raise ValueError(
             "After removing segmentation failures, the subset no longer contains both mated and non-mated pairs."
         )
-    pairwise = compute_pairwise_scores_iriscode(
-        labels,
-        base_codes,
-        base_masks,
-        rotated_codes,
-        rotated_masks,
-        offsets,
-    )
-    evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
-
-    if args.output:
-        output_path = save_results(
-            args.output,
-            pairwise,
-            evaluation,
+    matcher_name = MATCHER_IRISCODE
+    if args.parts is None:
+        pairwise = compute_pairwise_scores_iriscode(
             labels,
-            image_names,
-            dataset_path,
-            args.rotation,
-            MATCHER_IRISCODE,
+            base_codes,
+            base_masks,
+            rotated_codes,
+            rotated_masks,
+            offsets,
         )
-        print(f"Saved pairwise results to {output_path}")
+    else:
+        print(
+            "Using part-split average HD: "
+            f"parts={args.parts} eliminate={args.eliminate}"
+        )
+        part_rows = compute_pairwise_rotation_classifier(
+            labels,
+            base_codes,
+            base_masks,
+            rotated_codes,
+            rotated_masks,
+            offsets,
+            args.parts,
+            0.3955,
+            args.eliminate,
+            None,
+            1,
+            None,
+        )
+        pairwise = {
+            "scores": np.asarray([row["avg_hd"] for row in part_rows], dtype=np.float32),
+            "same_class": np.asarray([row["same_class"] for row in part_rows], dtype=bool),
+        }
+        matcher_name = f"{MATCHER_IRISCODE}_parts{args.parts}_hd"
+    evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
+    zero_false_accept = evaluate_zero_false_accept_threshold(
+        pairwise["same_class"],
+        pairwise["scores"],
+        lower_is_mated=True,
+    )
+    fmr_threshold = evaluate_fmr_threshold(
+        pairwise["same_class"],
+        pairwise["scores"],
+        args.fmr,
+        lower_is_mated=True,
+    )
+    zero_false_reject = evaluate_zero_false_reject_threshold(
+        pairwise["same_class"],
+        pairwise["scores"],
+        lower_is_mated=True,
+    )
+
     print(f"EER: {evaluation['eer']:.6f}")
-    print(f"EER threshold: {evaluation['eer_threshold']:.6f}")
+    print(f"EER HD threshold: {-evaluation['eer_threshold']:.6f}")
     print(f"ROC AUC: {evaluation['roc_auc']:.6f}")
+    if zero_false_accept["threshold"] is not None:
+        print(
+            "Zero non-mated classified as mated (FMR/FAR=0): "
+            f"HD threshold={zero_false_accept['threshold']:.6f} "
+            f"TPR={zero_false_accept['tpr']:.4f} "
+            f"FNMR/FNR={zero_false_accept['false_reject_rate']:.4f} "
+            f"({zero_false_accept['mated_accepted']}/{zero_false_accept['mated_total']} mated accepted)"
+        )
+    if fmr_threshold["threshold"] is not None:
+        print(
+            f"Target FMR/FAR={args.fmr:g}: "
+            f"HD threshold={fmr_threshold['threshold']:.6f} "
+            f"actual FMR/FAR={fmr_threshold['actual_fmr']:.8f} "
+            f"FNMR/FNR={fmr_threshold['fnmr']:.4f} "
+            f"({fmr_threshold['non_mated_accepted']}/{fmr_threshold['non_mated_total']} non-mated accepted, "
+            f"{fmr_threshold['mated_accepted']}/{fmr_threshold['mated_total']} mated accepted)"
+        )
+    if zero_false_reject["threshold"] is not None:
+        print(
+            "Zero mated classified as non-mated (FNMR/FNR=0): "
+            f"HD threshold={zero_false_reject['threshold']:.6f} "
+            f"FMR/FAR={zero_false_reject['false_accept_rate']:.4f} "
+            f"({zero_false_reject['non_mated_rejected']}/{zero_false_reject['non_mated_total']} non-mated rejected)"
+        )
 
     plot_metadata = {
         "dataset": dataset_format,
@@ -471,22 +756,32 @@ def main():
         "classes": summary["class_count"],
         "mated_pairs": summary["mated_pairs"],
         "non_mated_pairs": summary["non_mated_pairs"],
-        "max_samples": args.max_samples,
         "max_identities": args.max_identities,
         "max_images_per_identity": args.max_images_per_identity,
         "seed": args.seed,
         "matcher": MATCHER_IRISCODE,
+        "parts": args.parts,
+        "eliminate": args.eliminate if args.parts is not None else None,
+        "score": args.score if args.parts is not None else None,
+        "target_fmr": args.fmr,
+        "target_fmr_threshold": fmr_threshold["threshold"],
+        "target_fmr_actual_fmr": fmr_threshold["actual_fmr"],
+        "target_fmr_fnmr": fmr_threshold["fnmr"],
         "filter_count": len(selected_filters),
         "filters": filters_source,
         "skipped": len(skipped),
+        "scale": args.scale,
     }
     plot_results(
         pairwise["scores"],
         pairwise["same_class"],
         evaluation,
+        zero_false_accept=zero_false_accept,
+        zero_false_reject=zero_false_reject,
         figure_path=figure_output,
-        matcher=MATCHER_IRISCODE,
+        matcher=matcher_name,
         metadata=plot_metadata,
+        scale=args.scale,
     )
     print(f"Saved analysis figure to {Path(figure_output).expanduser().resolve()}")
 

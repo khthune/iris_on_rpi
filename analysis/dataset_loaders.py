@@ -13,9 +13,10 @@ DATASETS_ROOT = PROJECT_ROOT.parent / "datasets"
 CASIA_V1_PATH = DATASETS_ROOT / "CASIA Version.1" / "CASIA Iris Image Database (version 1.0)"
 CASIA_V3_INTERVAL_PATH = DATASETS_ROOT / "CASIA-IrisV3" / "CASIA-IrisV3-Interval"
 CASIA_V4_INTERVAL_PATH = DATASETS_ROOT / "CASIA-IrisV4-Interval"
+CASIA_DISTANCE_PATH = DATASETS_ROOT / "CASIA-Iris-Distance"
+CASIA_1000_PATH = DATASETS_ROOT / "CASIA-Iris-Thousand"
 CASIA_V3_LAMP_PATH = DATASETS_ROOT / "CASIA-IrisV3" / "CASIA-IrisV3-Lamp"
 CASIA_V3_TWINS_PATH = DATASETS_ROOT / "CASIA-IrisV3" / "CASIA-IrisV3-Twins"
-UBIRIS_V2_PATH = DATASETS_ROOT / "Ubiris v2"
 IITD_PATH = DATASETS_ROOT / "IIT Delhi Iris Database"
 MMU_PATH = DATASETS_ROOT / "MMU" / "MMU Iris Database"
 MMU2_PATH = DATASETS_ROOT / "MMU" / "MMU2 Iris Database" / "MMU2 Iris Database"
@@ -25,9 +26,10 @@ DATASET_CHOICES = [
     "casia-v1",
     "casia-v3-interval",
     "casia-v4-interval",
+    "casia-distance",
+    "casia-1000",
     "casia-v3-lamp",
     "casia-v3-twins",
-    "ubiris-v2",
     "iitd",
     "mmu",
     "mmu2",
@@ -154,6 +156,47 @@ def load_casia_v4_interval(dataset_path):
     )
 
 
+def load_casia_distance(dataset_path):
+    dataset_dir = Path(dataset_path).expanduser().resolve()
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+
+    image_paths = sorted(path for path in dataset_dir.glob("*/*.jpg") if path.name.lower() != "thumbs.db")
+    if not image_paths:
+        raise FileNotFoundError(
+            "No CASIA-Iris-Distance images were found. Expected files like YYY/S4YYYDNN.jpg."
+        )
+
+    def label_builder(image_path):
+        match = re.match(r"S4(?P<subject>\d+)D\d+$", image_path.stem, flags=re.IGNORECASE)
+        if not match:
+            raise ValueError(f"Unexpected CASIA-Iris-Distance filename format: {image_path.name}")
+        subject = match.group("subject")
+        return subject
+
+    return _load_images_with_labels(dataset_dir, image_paths, label_builder)
+
+
+def load_casia_1000(dataset_path):
+    dataset_dir = Path(dataset_path).expanduser().resolve()
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+
+    image_paths = sorted(path for path in dataset_dir.glob("*/*/*.jpg") if path.name.lower() != "thumbs.db")
+    if not image_paths:
+        raise FileNotFoundError(
+            "No CASIA-Iris-Thousand images were found. Expected files like YYY/L/S5YYYLNN.jpg."
+        )
+
+    def label_builder(image_path):
+        side = image_path.parent.name.upper()
+        if side not in {"L", "R"}:
+            raise ValueError(f"Unexpected CASIA-Iris-Thousand eye directory: {image_path}")
+        return f"{image_path.parent.parent.name}_{side}"
+
+    return _load_images_with_labels(dataset_dir, image_paths, label_builder)
+
+
 def load_casia_v3_lamp(dataset_path):
     dataset_dir = Path(dataset_path).expanduser().resolve()
     if not dataset_dir.exists():
@@ -188,30 +231,6 @@ def load_casia_v3_twins(dataset_path):
         image_paths,
         lambda image_path: f"{image_path.parent.parent.name}_{image_path.parent.name}",
     )
-
-
-def load_ubiris_v2(dataset_path):
-    dataset_dir = Path(dataset_path).expanduser().resolve()
-    if not dataset_dir.exists():
-        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
-
-    image_paths = sorted(
-        path
-        for path in dataset_dir.glob("CLASSES_*/*.tiff")
-        if path.name.lower() not in {"thumbs.db", ".ds_store"}
-    )
-    if not image_paths:
-        raise FileNotFoundError(
-            "No UBIRIS V2 images were found. Expected files like CLASSES_400_300_Part1/C100_S1_I1.tiff."
-        )
-
-    def label_builder(image_path):
-        match = re.match(r"C(\d+)_S\d+_I\d+$", image_path.stem, flags=re.IGNORECASE)
-        if not match:
-            raise ValueError(f"Unexpected UBIRIS filename format: {image_path.name}")
-        return f"C{match.group(1)}"
-
-    return _load_images_with_labels(dataset_dir, image_paths, label_builder)
 
 
 def load_iitd(dataset_path):
@@ -304,6 +323,10 @@ def resolve_dataset(dataset_path, dataset_format):
                 if "mmu iris database" in name:
                     return resolved_path, "mmu"
             if any(resolved_path.glob("*/*/*.jpg")):
+                if "thousand" in name or "1000" in name:
+                    return resolved_path, "casia-1000"
+                if "distance" in name:
+                    return resolved_path, "casia-distance"
                 if "v4" in name and "interval" in name:
                     return resolved_path, "casia-v4-interval"
                 if "interval" in name:
@@ -313,8 +336,9 @@ def resolve_dataset(dataset_path, dataset_format):
                 if "twins" in name:
                     return resolved_path, "casia-v3-twins"
                 return resolved_path, "casia-v3-interval"
-            if any(resolved_path.glob("CLASSES_*/*.tiff")):
-                return resolved_path, "ubiris-v2"
+            if any(resolved_path.glob("*/*.jpg")):
+                if "distance" in name:
+                    return resolved_path, "casia-distance"
             if any(resolved_path.glob("*.bmp")):
                 if "mmu2 iris database" in name:
                     return resolved_path, "mmu2"
@@ -331,12 +355,14 @@ def resolve_dataset(dataset_path, dataset_format):
         return CASIA_V3_INTERVAL_PATH, "casia-v3-interval"
     if dataset_format in ("auto", "casia-v4-interval") and CASIA_V4_INTERVAL_PATH.exists():
         return CASIA_V4_INTERVAL_PATH, "casia-v4-interval"
+    if dataset_format in ("auto", "casia-distance") and CASIA_DISTANCE_PATH.exists():
+        return CASIA_DISTANCE_PATH, "casia-distance"
+    if dataset_format in ("auto", "casia-1000") and CASIA_1000_PATH.exists():
+        return CASIA_1000_PATH, "casia-1000"
     if dataset_format in ("auto", "casia-v3-lamp") and CASIA_V3_LAMP_PATH.exists():
         return CASIA_V3_LAMP_PATH, "casia-v3-lamp"
     if dataset_format in ("auto", "casia-v3-twins") and CASIA_V3_TWINS_PATH.exists():
         return CASIA_V3_TWINS_PATH, "casia-v3-twins"
-    if dataset_format in ("auto", "ubiris-v2") and UBIRIS_V2_PATH.exists():
-        return UBIRIS_V2_PATH, "ubiris-v2"
     if dataset_format in ("auto", "iitd") and IITD_PATH.exists():
         return IITD_PATH, "iitd"
     if dataset_format in ("auto", "mmu") and MMU_PATH.exists():
@@ -349,9 +375,11 @@ def resolve_dataset(dataset_path, dataset_format):
         "Pass --dataset-path explicitly or place the dataset in one of these locations:\n"
         f"{CASIA_V1_PATH}\n"
         f"{CASIA_V3_INTERVAL_PATH}\n"
+        f"{CASIA_V4_INTERVAL_PATH}\n"
+        f"{CASIA_DISTANCE_PATH}\n"
+        f"{CASIA_1000_PATH}\n"
         f"{CASIA_V3_LAMP_PATH}\n"
         f"{CASIA_V3_TWINS_PATH}\n"
-        f"{UBIRIS_V2_PATH}\n"
         f"{IITD_PATH}\n"
         f"{MMU_PATH}\n"
         f"{MMU2_PATH}"
@@ -365,12 +393,14 @@ def load_dataset(dataset_path, dataset_format):
         return load_casia_v3_interval(dataset_path)
     if dataset_format == "casia-v4-interval":
         return load_casia_v4_interval(dataset_path)
+    if dataset_format == "casia-distance":
+        return load_casia_distance(dataset_path)
+    if dataset_format == "casia-1000":
+        return load_casia_1000(dataset_path)
     if dataset_format == "casia-v3-lamp":
         return load_casia_v3_lamp(dataset_path)
     if dataset_format == "casia-v3-twins":
         return load_casia_v3_twins(dataset_path)
-    if dataset_format == "ubiris-v2":
-        return load_ubiris_v2(dataset_path)
     if dataset_format == "iitd":
         return load_iitd(dataset_path)
     if dataset_format == "mmu":
@@ -403,6 +433,22 @@ def load_dataset_index(dataset_path, dataset_format):
             image_paths,
             lambda image_path: f"{image_path.parent.parent.name}_{image_path.parent.name}",
         )
+    if dataset_format == "casia-distance":
+        image_paths = sorted(path for path in dataset_dir.glob("*/*.jpg") if path.name.lower() != "thumbs.db")
+        def label_builder(image_path):
+            match = re.match(r"S4(?P<subject>\d+)D\d+$", image_path.stem, flags=re.IGNORECASE)
+            if not match:
+                raise ValueError(f"Unexpected CASIA-Iris-Distance filename format: {image_path.name}")
+            return match.group("subject")
+        return _build_index(dataset_dir, image_paths, label_builder)
+    if dataset_format == "casia-1000":
+        image_paths = sorted(path for path in dataset_dir.glob("*/*/*.jpg") if path.name.lower() != "thumbs.db")
+        def label_builder(image_path):
+            side = image_path.parent.name.upper()
+            if side not in {"L", "R"}:
+                raise ValueError(f"Unexpected CASIA-Iris-Thousand eye directory: {image_path}")
+            return f"{image_path.parent.parent.name}_{side}"
+        return _build_index(dataset_dir, image_paths, label_builder)
     if dataset_format == "casia-v3-lamp":
         image_paths = sorted(path for path in dataset_dir.glob("*/*/*.jpg") if path.name.lower() != "thumbs.db")
         return _build_index(
@@ -417,18 +463,6 @@ def load_dataset_index(dataset_path, dataset_format):
             image_paths,
             lambda image_path: f"{image_path.parent.parent.name}_{image_path.parent.name}",
         )
-    if dataset_format == "ubiris-v2":
-        image_paths = sorted(
-            path
-            for path in dataset_dir.glob("CLASSES_*/*.tiff")
-            if path.name.lower() not in {"thumbs.db", ".ds_store"}
-        )
-        def label_builder(image_path):
-            match = re.match(r"C(\d+)_S\d+_I\d+$", image_path.stem, flags=re.IGNORECASE)
-            if not match:
-                raise ValueError(f"Unexpected UBIRIS filename format: {image_path.name}")
-            return f"C{match.group(1)}"
-        return _build_index(dataset_dir, image_paths, label_builder)
     if dataset_format == "iitd":
         image_paths = sorted(
             path

@@ -9,6 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import MaxNLocator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -116,6 +117,8 @@ def plot_profile(
     axis.set_title("Hamming Distance Across Rotation Offsets")
     axis.set_xlabel("Rotation offset")
     axis.set_ylabel("Hamming distance")
+    axis.xaxis.set_major_locator(MaxNLocator(nbins=12, integer=True))
+    axis.tick_params(axis="x", labelsize=8)
     axis.grid(True, alpha=0.3)
     axis.legend(loc="best")
 
@@ -174,6 +177,7 @@ def main():
     parser.add_argument("--csv-output", default=None, help="Optional CSV output path.")
     parser.add_argument(
         "--filters",
+        dest="filters",
         default=None,
         help="Optional Python filters file containing a 'filters' list. Defaults to project filters.py.",
     )

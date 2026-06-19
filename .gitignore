@@ -2,9 +2,17 @@ improve_filters/
 extra_files/
 captures/
 dataset/
+GT/
+GT-masks/
 
 iriscodes.npy/
 analysis/output/
+analysis/pairwise_iris_analysis_output/
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
 wahet
 *.npy
 

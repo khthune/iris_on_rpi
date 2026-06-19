@@ -1,125 +1,117 @@
-# Iris Recognition CLI
+# Iris Recognition on Raspberry Pi
 
-A command-line tool for iris code generation, comparison, and management using OpenCV and custom iris recognition algorithms.
+This repository contains an iris recognition pipeline built around classical iriscode matching. The main pipeline segments an eye image, unwraps the iris annulus into a normalized band, applies Gabor-style filters, creates an iriscode and validity mask, and compares iriscodes with rotation-aware Hamming distance.
 
-## Installation
+The project is mainly used for research on recognition performance, segmentation quality, filter design, rotation compensation, threshold selection, and Raspberry Pi suitability. The core pipeline is kept relatively small and interpretable, while most experiments live in [`analysis/`](analysis/).
 
-1. Clone the repository:
+## Repository Layout
+
+- [`iris.py`](iris.py): core iris pipeline, segmentation loading, iris-band extraction, iriscode generation, and matching helpers.
+- [`filters.py`](filters.py): default Gabor filter bank used by the pipeline.
+- [`cli.py`](cli.py): command-line interface for generating, comparing, finding, and enrolling iriscodes.
+- [`models/`](models/): local model files used by the pipeline.
+- [`analysis/`](analysis/): benchmark scripts, plots, dataset loaders, filter experiments, part-based scoring, and research utilities.
+
+See [`analysis/README.md`](analysis/README.md) for the analysis scripts, common commands, and experiment parameters.
+
+## Setup
+
+Create a virtual environment and install the Python dependencies:
 
 ```bash
-git clone <repo_url>
-cd <repo_directory>
-```
-
-2. Create a virtual environment and install dependencies:
-
-```bash
-python -m venv .venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Ensure the pretrained U-Net segmentation model exists at:
+All project and analysis dependencies are kept in the root [`requirements.txt`](requirements.txt).
+
+The active segmentation model is loaded by the pipeline code. If you need to override it for a local experiment, set `SEG_PATH` explicitly when running a command.
+
+## CLI Usage
+
+Generate an iriscode from one image:
 
 ```bash
-models/iris_semseg_upp_scse_mobilenetv2.onnx
+python cli.py iris-gen path/to/eye.png -o iris_code.npy
 ```
 
-## Usage
-
-The CLI provides several commands for iris recognition tasks.
-
-### Generate Iris Code from a Single Image
+Generate iriscodes from several images:
 
 ```bash
-python cli.py iris_gen <filename> [-o <output_file>] [-v]
+python cli.py iris-gens path/to/images/*.png
 ```
 
-- `<filename>`: Path to the input image.
-- `-o`: Optional. Specify output `.npy` file for the iris code.
-- `-v`: Verbose. Prints the iris code and mask code to the terminal.
-
-Example:
+Compare two eye images:
 
 ```bash
-python cli.py iris_gen images/eye1.jpg -o iris_code1.npy
+python cli.py compare path/to/eye1.png path/to/eye2.png --rotation 21
 ```
 
-### Generate Iris Codes from Multiple Images
+Compare an image against a saved iriscode database:
 
 ```bash
-python main.py iris_gens <filename1> <filename2> ...
+python cli.py compare-iris-code path/to/eye.png iriscodes.npy --rotation 21
 ```
 
-- Generates iris codes for multiple images and saves them to `iriscodes.npy`.
-
-Example:
+Find the best match in a saved iriscode database:
 
 ```bash
-python cli.py iris_gens images/*.png
+python cli.py find path/to/eye.png iriscodes.npy --rotation 21 --threshold 0.3
 ```
 
-### Compare Two Images
+Enroll a new iriscode into an existing database:
 
 ```bash
-python cli.py compare <filename1> <filename2> [--rotation <rotation>]
+python cli.py enroll path/to/eye.png iriscodes.npy
 ```
 
-- Compares two iris images and outputs the Hamming distance.
-- Default rotation: 21
+## Analysis Workflow
 
-### Compare Image Against an Iris Code
+Most research work is done from the `analysis/` folder:
 
 ```bash
-python cli.py compare_iris_code <filename> <code_path> [--rotation <rotation>]
+cd analysis
+../.venv/bin/python benchmark_pipeline.py --datasets casia-v4-interval iitd --max-id 80 --max-img-per-id 15 --seed 70 --rotation 21
 ```
 
-- Compares an iris image to a stored iris code.
-- Default `code_path`: iriscodes.npy
+Generated plots, benchmark JSON files, score caches, manifests, and other run outputs should stay under `analysis/output/`.
 
+## Datasets and Private Data
 
-### Find Best Match in Iris Database
+Dataset folders, generated outputs, and local model artifacts can be large or license-restricted. Do not commit datasets or generated benchmark outputs by default.
 
-```bash
-python cli.py find <filename> <iriscodes> [--rotation <rotation>] [--threshold <threshold>]
-```
+Ground-truth iris masks are not stored in this repository. The masks used for GT-mask experiments came from the IRISEG-EP dataset page:
 
-- Searches a database of iris codes and returns the best match index and score.
-- Default `rotation`: 21
-- Default `threshold`: 0.3
-- Default `iriscodes`: iriscodes.npy
+- [IRISEG-EP, WaveLab / Hofbauer14b](https://www.wavelab.at/sources/Hofbauer14b/)
 
-### Enroll a New Iris Code
+CASIA v3 Interval ground-truth masks can also be found here:
 
-```bash
-python cli.py enroll <filename> <iriscodes>
-```
+- [HalmstadUniversityBiometrics/Iris-Segmentation-Groundtruth-Database](https://github.com/HalmstadUniversityBiometrics/Iris-Segmentation-Groundtruth-Database)
 
-- Adds a new iris code to the existing database.
-- Default `iriscodes`: iriscodes.npy
+Local GT-mask benchmarking is supported for `casia-v3-interval`, `casia-v4-interval`, and `iitd` when the private GT folders and generated manifests are present.
+
+Generated analysis outputs should stay under:
+
+- `analysis/output/`
+
+## Supported Dataset Names
+
+Many analysis scripts support these dataset identifiers:
+
+- `casia-v1`
+- `casia-v3-interval`
+- `casia-v4-interval`
+- `casia-distance`
+- `casia-1000`
+- `casia-v3-lamp`
+- `casia-v3-twins`
+- `iitd`
+- `mmu`
+- `mmu2`
 
 ## Notes
 
-- Input images must exist at the specified paths.
-- Iris codes and masks are stored as NumPy boolean arrays.
-- Ensure the `filters` and `iris` modules are correctly installed and accessible.
-
-## Example Workflow
-
-1. Generate iris codes for a dataset:
-
-```bash
-python cli.py iris_gens dataset/*.jpg
-```
-
-2. Compare a new image to the database:
-
-```bash
-python cli.py find new_image.jpg iriscodes.npy
-```
-
-3. Enroll a new iris:
-
-```bash
-python cli.py enroll new_image.jpg iriscodes.npy
-```
+- The default filters file is [`filters.py`](filters.py).
+- Rotation values are horizontal pixel offsets in the normalized iriscode search.
+- Lower Hamming distance means two iriscodes are more similar.
