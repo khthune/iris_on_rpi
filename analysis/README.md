@@ -59,6 +59,47 @@ Useful options:
 - `--match-parts N`: with `--score match-rotation`, predict mated when at least `N` parts match.
 - `--tolerance-offset N`: treat rotations within `+-N` pixels of the anchor rotation as matching, and keep only parts within that tolerance for HD scoring.
 
+### `benchmark_repeated_subsets.py`
+
+Runs `benchmark_pipeline.py` repeatedly on different random subsets and reports mean/std metrics across seeds. This is useful when a dataset is too large to evaluate fully, but one subset is not stable enough to report.
+
+Example:
+
+```bash
+../.venv/bin/python benchmark_repeated_subsets.py \
+  --dataset casia-v3-interval casia-v4-interval \
+  --runs 10 \
+  --seed-start 50 \
+  --max-id 150 \
+  --max-img-per-id 10 \
+  --rotation 71 \
+  --filters ../filters.py \
+  --segmenter unet \
+  --target-fpr 0.001 0.0001 \
+  --output-name subset_std_rot71
+```
+
+The script summarizes EER, EER threshold, and TAR/TPR at each requested FAR/FPR target.
+
+### `benchmark_cli.py`
+
+Benchmarks CLI-style operations on selected images: enroll, compare against a stored iriscode, compare two images, and find against a small in-memory database. The plot shows mean runtime with standard-deviation error bars, and the terminal output reports a pipeline step timing breakdown.
+
+Example:
+
+```bash
+../.venv/bin/python benchmark_cli.py \
+  path/to/query.png \
+  path/to/compare.png \
+  --database-images path/to/query.png path/to/compare.png \
+  --runs 100 \
+  --rotation 71 \
+  --filters ../filters.py \
+  --iris-engine current \
+  --segmenter unet \
+  --output-name cli_runtime_rot71.png
+```
+
 ### `pairwise_iris_analysis.py`
 
 Computes all pairwise scores for one dataset and plots mated/non-mated Hamming-distance distributions.
@@ -67,7 +108,7 @@ Example:
 
 ```bash
 ../.venv/bin/python pairwise_iris_analysis.py \
-  --dataset-format casia-v4-interval \
+  --dataset casia-v4-interval \
   --output-name v4int_baseline_s70_rot21 \
   --rotation 21 \
   --max-id 80 \
@@ -78,7 +119,7 @@ Example:
 
 Useful options:
 
-- `--dataset-path`: override the dataset folder while keeping `--dataset-format` as the dataset layout selector.
+- `--dataset-path`: override the dataset folder while keeping `--dataset` as the dataset layout selector.
 - `--output-name`: name the generated distribution/ROC/EER figure.
 
 ### `compare_pipelines.py`
@@ -233,7 +274,7 @@ Example with multiple images:
 
 ```bash
 ../.venv/bin/python mask_occlusion_tests.py multiple \
-  --dataset-format casia-v4-interval \
+  --dataset casia-v4-interval \
   --max-id 20 \
   --max-img-per-id 1 \
   --seed 70 \

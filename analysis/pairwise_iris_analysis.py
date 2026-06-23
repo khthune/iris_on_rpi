@@ -4,6 +4,7 @@ from argparse import ArgumentParser
 from itertools import combinations
 import os
 from pathlib import Path
+import shutil
 import sys
 import time
 
@@ -23,7 +24,7 @@ os.environ.setdefault("XDG_CACHE_HOME", str(XDG_CACHE_DIR))
 
 from dataset_loaders import DATASET_CHOICES, dataset_output_slug, load_dataset, resolve_dataset, sample_dataset
 from filter_loader import load_filter_bank
-from iris import IrisClassifier, get_iris_band
+from iris import IrisClassifier as CurrentIrisClassifier, get_iris_band
 from rotation_part_scoring import compute_pairwise_rotation_classifier
 
 import matplotlib
@@ -39,6 +40,31 @@ DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "pairwise_iris
 MATCHER_IRISCODE = "iriscode"
 
 
+def load_iris_classifier_class(iris_engine):
+    if iris_engine == "current":
+        return CurrentIrisClassifier
+    if iris_engine == "legacy":
+        from legacy_iris import IrisClassifier as LegacyIrisClassifier
+
+        return LegacyIrisClassifier
+    raise ValueError(f"Unknown iris engine: {iris_engine}")
+
+
+def build_wahet_band_getter():
+    local_wahet = ANALYSIS_ROOT / "wahet"
+    wahet_executable = local_wahet if local_wahet.exists() else shutil.which("wahet")
+    if wahet_executable is None:
+        raise FileNotFoundError(
+            f"--segmenter wahet requested, but WAHET was not found at {local_wahet} or in PATH."
+        )
+    from legacy_iris import get_iris_band as get_wahet_iris_band
+
+    def get_wahet_band(image, _image_name):
+        return get_wahet_iris_band(image, wahet_executable=wahet_executable)
+
+    return get_wahet_band
+
+
 def add_figure_metadata(figure, metadata):
     if not metadata:
         return
@@ -47,7 +73,17 @@ def add_figure_metadata(figure, metadata):
         figure.text(0.01, 0.01, text, ha="left", va="bottom", fontsize=7, family="monospace", wrap=True)
 
 
-def precompute_codes(images, labels, image_names, classifier, rotation, band_getter=None, offsets=None):
+def precompute_codes(
+    images,
+    labels,
+    image_names,
+    classifier,
+    rotation,
+    band_getter=None,
+    offsets=None,
+    min_valid_iris_pixels=None,
+    rotation_method="recompute",
+):
     if band_getter is None:
         band_getter = lambda image, _image_name: get_iris_band(image)
     if offsets is None:
@@ -77,22 +113,47 @@ def precompute_codes(images, labels, image_names, classifier, rotation, band_get
         if iris_band is None or iris_mask is None:
             skipped.append((index - 1, str(image_names[index - 1]), "segmentation returned None"))
             continue
-
         base_code, base_mask, _ = classifier.get_iris_code(iris_band, iris_mask, offset=0)
+        base_mask = np.asarray(base_mask, dtype=bool)
+        if min_valid_iris_pixels is not None:
+            valid_iriscode_bits = int(np.sum(base_mask))
+            if valid_iriscode_bits < min_valid_iris_pixels:
+                skipped.append(
+                    (
+                        index - 1,
+                        str(image_names[index - 1]),
+                        f"valid iriscode bits {valid_iriscode_bits} < {min_valid_iris_pixels}",
+                    )
+                )
+                continue
+
         base_codes.append(np.asarray(base_code, dtype=bool))
-        base_masks.append(np.asarray(base_mask, dtype=bool))
+        base_masks.append(base_mask)
         kept_labels.append(labels[index - 1])
         kept_image_names.append(image_names[index - 1])
 
-        image_rotated_codes = []
-        image_rotated_masks = []
-        for offset in offsets:
-            code, code_mask, _ = classifier.get_iris_code(iris_band, iris_mask, offset=int(offset))
-            image_rotated_codes.append(np.asarray(code, dtype=bool))
-            image_rotated_masks.append(np.asarray(code_mask, dtype=bool))
-
-        rotated_codes.append(np.stack(image_rotated_codes, axis=0))
-        rotated_masks.append(np.stack(image_rotated_masks, axis=0))
+        if rotation_method == "recompute":
+            image_rotated_codes = []
+            image_rotated_masks = []
+            for offset in offsets:
+                code, code_mask, _ = classifier.get_iris_code(iris_band, iris_mask, offset=int(offset))
+                image_rotated_codes.append(np.asarray(code, dtype=bool))
+                image_rotated_masks.append(np.asarray(code_mask, dtype=bool))
+            rotated_codes.append(np.stack(image_rotated_codes, axis=0))
+            rotated_masks.append(np.stack(image_rotated_masks, axis=0))
+        elif rotation_method == "roll":
+            if not hasattr(classifier, "_roll_iris_code_offsets"):
+                raise ValueError("--rotation-method roll is only available for the current iris engine.")
+            rolled_codes, rolled_masks = classifier._roll_iris_code_offsets(
+                np.asarray(base_code, dtype=bool),
+                base_mask,
+                iris_band.shape,
+                offsets,
+            )
+            rotated_codes.append(rolled_codes)
+            rotated_masks.append(rolled_masks)
+        else:
+            raise ValueError(f"Unknown rotation method: {rotation_method}")
 
     if not base_codes:
         raise RuntimeError("Segmentation failed for every sampled image.")
@@ -120,28 +181,38 @@ def best_score_against_rotations(base_code, base_mask, candidate_codes, candidat
     scores[valid_rows] = mismatch_bits[valid_rows] / valid_bits[valid_rows]
 
     best_index = int(np.argmin(scores))
-    return float(scores[best_index]), best_index
+    return float(scores[best_index]), best_index, int(valid_bits[best_index])
 
 
-def compute_pairwise_scores_iriscode(labels, base_codes, base_masks, rotated_codes, rotated_masks, offsets):
+def compute_pairwise_scores_iriscode(
+    labels,
+    base_codes,
+    base_masks,
+    rotated_codes,
+    rotated_masks,
+    offsets,
+    min_valid_bits=None,
+):
     idx1_list = []
     idx2_list = []
     score_list = []
     same_class_list = []
     best_offset_list = []
     direction_list = []
+    valid_bits_list = []
+    skipped_low_valid_bits = 0
 
     pair_count = len(labels) * (len(labels) - 1) // 2
     started = time.perf_counter()
 
     for pair_index, (idx1, idx2) in enumerate(combinations(range(len(labels)), 2), start=1):
-        score_12, offset_index_12 = best_score_against_rotations(
+        score_12, offset_index_12, valid_bits_12 = best_score_against_rotations(
             base_codes[idx1],
             base_masks[idx1],
             rotated_codes[idx2],
             rotated_masks[idx2],
         )
-        score_21, offset_index_21 = best_score_against_rotations(
+        score_21, offset_index_21, valid_bits_21 = best_score_against_rotations(
             base_codes[idx2],
             base_masks[idx2],
             rotated_codes[idx1],
@@ -152,10 +223,22 @@ def compute_pairwise_scores_iriscode(labels, base_codes, base_masks, rotated_cod
             best_score = score_12
             best_offset = int(offsets[offset_index_12])
             direction = 1
+            valid_bits = valid_bits_12
         else:
             best_score = score_21
             best_offset = int(offsets[offset_index_21])
             direction = -1
+            valid_bits = valid_bits_21
+
+        if min_valid_bits is not None and valid_bits < min_valid_bits:
+            skipped_low_valid_bits += 1
+            if pair_index == 1 or pair_index % 25000 == 0 or pair_index == pair_count:
+                elapsed = time.perf_counter() - started
+                print(
+                    f"Scored pairs: {pair_index}/{pair_count} in {elapsed:.1f}s "
+                    f"(skipped low valid bits: {skipped_low_valid_bits})"
+                )
+            continue
 
         idx1_list.append(idx1)
         idx2_list.append(idx2)
@@ -163,10 +246,14 @@ def compute_pairwise_scores_iriscode(labels, base_codes, base_masks, rotated_cod
         same_class_list.append(labels[idx1] == labels[idx2])
         best_offset_list.append(best_offset)
         direction_list.append(direction)
+        valid_bits_list.append(valid_bits)
 
         if pair_index == 1 or pair_index % 25000 == 0 or pair_index == pair_count:
             elapsed = time.perf_counter() - started
-            print(f"Scored pairs: {pair_index}/{pair_count} in {elapsed:.1f}s")
+            suffix = ""
+            if min_valid_bits is not None:
+                suffix = f" (skipped low valid bits: {skipped_low_valid_bits})"
+            print(f"Scored pairs: {pair_index}/{pair_count} in {elapsed:.1f}s{suffix}")
 
     return {
         "idx1": np.array(idx1_list, dtype=np.int32),
@@ -175,6 +262,9 @@ def compute_pairwise_scores_iriscode(labels, base_codes, base_masks, rotated_cod
         "same_class": np.array(same_class_list, dtype=bool),
         "best_offset": np.array(best_offset_list, dtype=np.int16),
         "direction": np.array(direction_list, dtype=np.int8),
+        "valid_bits": np.array(valid_bits_list, dtype=np.int32),
+        "skipped_low_valid_bits": int(skipped_low_valid_bits),
+        "total_candidate_pairs": int(pair_count),
     }
 
 
@@ -505,14 +595,14 @@ def main():
         help="Path to the dataset directory. If omitted, a known default path is used.",
     )
     parser.add_argument(
-        "--dataset-format",
+        "--dataset",
+        dest="dataset_format",
         default=DEFAULT_DATASET_FORMAT,
         choices=DATASET_CHOICES,
         help="Dataset folder layout to load",
     )
     parser.add_argument(
         "--output-name",
-        "--figure-name",
         dest="output_name",
         default=None,
         help="Output filename for the figure inside the default output directory. Example: my_run.png",
@@ -528,6 +618,18 @@ def main():
         dest="filters",
         default=None,
         help="Optional Python filters file containing a 'filters' list. Defaults to project filters.py.",
+    )
+    parser.add_argument(
+        "--iris-engine",
+        choices=["current", "legacy"],
+        default="current",
+        help="Recognition engine to use for iriscode generation and comparison.",
+    )
+    parser.add_argument(
+        "--segmenter",
+        choices=["unet", "wahet"],
+        default="unet",
+        help="Segmentation/normalization method to use.",
     )
     parser.add_argument(
         "--parts",
@@ -632,7 +734,13 @@ def main():
     selected_filters, filters_source = load_filter_bank(args.filters)
     print(f"Filters in use: {len(selected_filters)}")
     print(f"Filters source: {filters_source}")
-    classifier = IrisClassifier(selected_filters)
+    print(f"Iris engine: {args.iris_engine}")
+    print(f"Segmenter: {args.segmenter}")
+    classifier_class = load_iris_classifier_class(args.iris_engine)
+    classifier = classifier_class(selected_filters)
+    band_getter = None
+    if args.segmenter == "wahet":
+        band_getter = build_wahet_band_getter()
     (
         base_codes,
         base_masks,
@@ -648,6 +756,7 @@ def main():
         image_names,
         classifier,
         args.rotation,
+        band_getter=band_getter,
     )
     if skipped:
         print(f"Skipped {len(skipped)} images due to segmentation failure.")
@@ -750,6 +859,8 @@ def main():
         "dataset": dataset_format,
         "dataset_path": dataset_path,
         "seg_path": os.environ.get("SEG_PATH"),
+        "iris_engine": args.iris_engine,
+        "segmenter": args.segmenter,
         "output_name": args.output_name,
         "rotation": args.rotation,
         "samples": summary["sample_count"],

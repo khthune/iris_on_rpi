@@ -8,8 +8,6 @@ from pathlib import Path
 from numpy.lib.stride_tricks import sliding_window_view
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_BAND_SHAPE = (64, 512)
-DEFAULT_INVALID_DILATION_KERNEL = max(1, int(os.environ.get("IRIS_UNET_INVALID_DILATION_KERNEL", 1)))
-DEFAULT_INVALID_DILATION_ITERATIONS = max(1, int(os.environ.get("IRIS_UNET_INVALID_DILATION_ITERATIONS", 1)))
 
 
 @dataclass(frozen=True)
@@ -158,29 +156,10 @@ def fit_polar_boundary_from_mask(mask, center, num_angles=DEFAULT_BAND_SHAPE[1],
     return PolarBoundary(center_x=float(center_x), center_y=float(center_y), radii=_periodic_smooth(filled, smooth_kernel))
 
 
-def dilate_invalid_region(valid_mask, support_mask, kernel_size=DEFAULT_INVALID_DILATION_KERNEL, iterations=DEFAULT_INVALID_DILATION_ITERATIONS):
-    kernel_size = max(int(kernel_size), 1)
-    iterations = max(int(iterations), 1)
-    valid_bool = np.asarray(valid_mask) > 0
-    support_bool = np.asarray(support_mask) > 0
-    invalid_inside_support = support_bool & ~valid_bool
-    if not np.any(invalid_inside_support):
-        return valid_bool.astype(np.uint8) * 255
-
-    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    dilated_invalid = cv.dilate(invalid_inside_support.astype(np.uint8), kernel, iterations=iterations) > 0
-    dilated_valid = support_bool & ~dilated_invalid
-    return dilated_valid.astype(np.uint8) * 255
-
-
 def build_valid_source_mask(
     iris_mask,
     pupil_mask,
     occlusion_mask=None,
-    source_image=None,
-    oversat_threshold=254,
-    invalid_dilation_kernel=DEFAULT_INVALID_DILATION_KERNEL,
-    invalid_dilation_iterations=DEFAULT_INVALID_DILATION_ITERATIONS,
 ):
     iris_mask = clean_component_mask(iris_mask)
     pupil_mask = clean_component_mask(pupil_mask)
@@ -188,15 +167,7 @@ def build_valid_source_mask(
     valid = annulus_mask.copy()
     if occlusion_mask is not None:
         valid &= ~(np.asarray(occlusion_mask) > 0)
-    if source_image is not None:
-        source = np.asarray(source_image)
-        valid &= source < oversat_threshold
-    return dilate_invalid_region(
-        valid.astype(np.uint8) * 255,
-        annulus_mask.astype(np.uint8) * 255,
-        kernel_size=invalid_dilation_kernel,
-        iterations=invalid_dilation_iterations,
-    )
+    return valid.astype(np.uint8) * 255
 
 
 def normalize_iris_from_boundaries(image, pupil_boundary, iris_boundary, valid_source_mask, band_shape=DEFAULT_BAND_SHAPE):
@@ -237,25 +208,11 @@ def semantic_masks_to_band(
     occlusion_mask=None,
     band_shape=DEFAULT_BAND_SHAPE,
     prefer_ellipse=True,
-    invalid_dilation_kernel=DEFAULT_INVALID_DILATION_KERNEL,
-    invalid_dilation_iterations=DEFAULT_INVALID_DILATION_ITERATIONS,
 ):
-    if occlusion_mask is not None:
-        occlusion_mask = clean_component_mask(occlusion_mask, kernel_size=3)
-        occlusion_mask = cv.dilate(
-            occlusion_mask,
-            cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)),
-            iterations=1,
-        )
-
     valid_source_mask = build_valid_source_mask(
         iris_mask,
         pupil_mask,
         occlusion_mask,
-        source_image=image,
-        oversat_threshold=254,
-        invalid_dilation_kernel=invalid_dilation_kernel,
-        invalid_dilation_iterations=invalid_dilation_iterations,
     )
     pupil_ellipse = fit_boundary_from_mask(pupil_mask, prefer_ellipse=prefer_ellipse)
     center = (pupil_ellipse.center_x, pupil_ellipse.center_y)
@@ -303,8 +260,6 @@ def binary_iris_mask_to_band(
     iris_or_annulus_mask,
     band_shape=DEFAULT_BAND_SHAPE,
     prefer_ellipse=True,
-    invalid_dilation_kernel=DEFAULT_INVALID_DILATION_KERNEL,
-    invalid_dilation_iterations=DEFAULT_INVALID_DILATION_ITERATIONS,
 ):
     annulus_mask = clean_component_mask(iris_or_annulus_mask)
     pupil_mask = _infer_pupil_mask_from_binary_iris(annulus_mask)
@@ -316,8 +271,6 @@ def binary_iris_mask_to_band(
         occlusion_mask=None,
         band_shape=band_shape,
         prefer_ellipse=prefer_ellipse,
-        invalid_dilation_kernel=invalid_dilation_kernel,
-        invalid_dilation_iterations=invalid_dilation_iterations,
     )
 def _resolve_segmentation_model_path():
     configured = os.environ.get(
@@ -355,7 +308,7 @@ def _resolve_segmentation_model_path():
 def get_segmentation_backend_name(backend=None):
     if backend is not None:
         return str(backend)
-    return "sam-iris" if _is_sam_segmentation_path() else "onnx"
+    return "unet"
 
 
 UNET_ONNX_PATH = _resolve_segmentation_model_path()
@@ -369,12 +322,6 @@ UNET_BAND_SHAPE = (
     int(os.environ.get("IRIS_UNET_BAND_WIDTH", DEFAULT_BAND_SHAPE[1])),
 )
 _UNET_NET = None
-_SAM_PREDICTOR = None
-
-
-def _is_sam_segmentation_path(path=None):
-    path = UNET_ONNX_PATH if path is None else Path(path)
-    return path.suffix.lower() in {".pt", ".pth"}
 
 def hamming_distance(a,b,mask1, mask2):
     diff = np.bitwise_xor(a,b)
@@ -524,9 +471,9 @@ def _get_unet_net():
     global _UNET_NET
     if _UNET_NET is not None:
         return _UNET_NET
-    if _is_sam_segmentation_path():
+    if UNET_ONNX_PATH.suffix.lower() != ".onnx":
         raise ValueError(
-            f"SEG_PATH points to a SAM/Iris-SAM PyTorch checkpoint, not ONNX: {UNET_ONNX_PATH}"
+            f"Segmentation model must be an ONNX file, got: {UNET_ONNX_PATH}"
         )
     if not UNET_ONNX_PATH.exists():
         raise FileNotFoundError(
@@ -544,82 +491,6 @@ def _get_unet_net():
         net.setPreferableTarget(target)
     _UNET_NET = net
     return net
-
-
-def _resolve_sam_device(torch_module):
-    configured = os.environ.get("IRIS_SAM_DEVICE", "auto").strip().lower()
-    if configured and configured != "auto":
-        return configured
-    if torch_module.cuda.is_available():
-        return "cuda"
-    if hasattr(torch_module.backends, "mps") and torch_module.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def _get_sam_predictor():
-    global _SAM_PREDICTOR
-    if _SAM_PREDICTOR is not None:
-        return _SAM_PREDICTOR
-    if not UNET_ONNX_PATH.exists():
-        raise FileNotFoundError(
-            f"Iris-SAM checkpoint not found at '{UNET_ONNX_PATH}'. "
-            "Set SEG_PATH to the downloaded Iris-SAM model.pt checkpoint."
-        )
-    try:
-        import torch
-        from segment_anything import SamPredictor, sam_model_registry
-    except ImportError as exc:
-        raise ImportError(
-            "Iris-SAM needs PyTorch and Meta's segment-anything package. Install with: "
-            "python3 -m pip install git+https://github.com/facebookresearch/segment-anything.git"
-        ) from exc
-
-    model_type = os.environ.get("IRIS_SAM_MODEL_TYPE", "vit_h").strip()
-    if model_type not in sam_model_registry:
-        available = ", ".join(sorted(sam_model_registry))
-        raise ValueError(f"Unknown IRIS_SAM_MODEL_TYPE={model_type!r}. Available: {available}")
-    device = _resolve_sam_device(torch)
-    model = sam_model_registry[model_type](checkpoint=None)
-    checkpoint = torch.load(str(UNET_ONNX_PATH), map_location="cpu")
-    if isinstance(checkpoint, dict) and "model" in checkpoint:
-        checkpoint = checkpoint["model"]
-    model.load_state_dict(checkpoint)
-    model.to(device=device)
-    model.eval()
-    _SAM_PREDICTOR = SamPredictor(model)
-    return _SAM_PREDICTOR
-
-
-def _sam_prompt_box(image_shape):
-    image_h, image_w = image_shape[:2]
-    scale = float(os.environ.get("IRIS_SAM_BOX_SCALE", 1.0))
-    scale = min(max(scale, 0.05), 1.0)
-    box_w = image_w * scale
-    box_h = image_h * scale
-    x1 = max(0.0, (image_w - box_w) / 2.0)
-    y1 = max(0.0, (image_h - box_h) / 2.0)
-    x2 = min(float(image_w - 1), x1 + box_w - 1.0)
-    y2 = min(float(image_h - 1), y1 + box_h - 1.0)
-    return np.array([x1, y1, x2, y2], dtype=np.float32)
-
-
-def _predict_sam_iris_annulus_mask(img):
-    source_gray = _prepare_segmentation_gray(img)
-    if img.ndim == 2:
-        rgb = cv.cvtColor(img, cv.COLOR_GRAY2RGB)
-    else:
-        rgb = cv.cvtColor(img, cv.COLOR_BGR2RGB)
-
-    predictor = _get_sam_predictor()
-    predictor.set_image(rgb)
-    masks, _scores, _logits = predictor.predict(
-        point_coords=None,
-        point_labels=None,
-        box=_sam_prompt_box(rgb.shape),
-        multimask_output=False,
-    )
-    return source_gray, masks[0].astype(bool)
 
 
 def _sigmoid_if_needed(output):
@@ -647,13 +518,6 @@ def _forward_segmentation_model(img):
 
 
 def predict_unet_masks(img):
-    if _is_sam_segmentation_path():
-        source_gray, annulus_mask = _predict_sam_iris_annulus_mask(img)
-        pupil_mask = _infer_pupil_mask_from_binary_iris(annulus_mask)
-        iris_mask = clean_component_mask((annulus_mask.astype(bool) | pupil_mask.astype(bool)).astype(np.uint8))
-        eyelash_mask = np.zeros_like(iris_mask, dtype=bool)
-        return source_gray, iris_mask.astype(bool), pupil_mask.astype(bool), eyelash_mask
-
     source_gray, output = _forward_segmentation_model(img)
     if output.ndim != 4:
         raise RuntimeError(f"Unexpected segmentation output shape: {output.shape}")
@@ -689,9 +553,6 @@ def predict_unet_masks(img):
 
 
 def predict_binary_iris_mask(img):
-    if _is_sam_segmentation_path():
-        return _predict_sam_iris_annulus_mask(img)
-
     source_gray, output = _forward_segmentation_model(img)
     if output.ndim != 4 or output.shape[1] != 1:
         raise RuntimeError(f"Unexpected binary segmentation output shape: {output.shape}")
@@ -704,15 +565,6 @@ def predict_binary_iris_mask(img):
 
 
 def _segment_with_unet(img):
-    if _is_sam_segmentation_path():
-        source_gray, annulus_mask = _predict_sam_iris_annulus_mask(img)
-        return binary_iris_mask_to_band(
-            source_gray,
-            annulus_mask,
-            band_shape=UNET_BAND_SHAPE,
-            prefer_ellipse=True,
-        )
-
     source_gray, output = _forward_segmentation_model(img)
     if output.ndim != 4:
         raise RuntimeError(f"Unexpected segmentation output shape: {output.shape}")
@@ -772,9 +624,17 @@ class IrisClassifier():
             self._filters.append((real_filter, imag_filter))
         self._filter_settings = filters
 
-    def __call__(self, iris1, iris2, mask1, mask2, rotation=6, offset=0):
+    def __call__(self, iris1, iris2, mask1, mask2, rotation=6, offset=0, rotation_method="recompute"):
         bits_1, mask_1, _ = self.get_iris_code(iris1, mask1)
-        return self.compare_iris_code_and_iris(iris2, bits_1, mask2, mask_1, rotation=rotation, offset=offset)
+        return self.compare_iris_code_and_iris(
+            iris2,
+            bits_1,
+            mask2,
+            mask_1,
+            rotation=rotation,
+            offset=offset,
+            rotation_method=rotation_method,
+        )
     
     def _encode_iris_offsets(self, iris, mask=None, offsets=(0,)):
         offsets = np.asarray(offsets, dtype=np.int64)
@@ -823,12 +683,63 @@ class IrisClassifier():
     def get_iris_codes(self, iris, mask=None, offsets=(0,)):
         bits, mask_bits, filters = self._encode_iris_offsets(iris, mask, offsets=offsets)
         return bits, mask_bits, filters
+
+    @staticmethod
+    def _pixel_offset_to_grid_shift(offset, x_stride):
+        magnitude = int(np.floor(abs(offset) / x_stride + 0.5))
+        if offset < 0:
+            magnitude = -magnitude
+        # A positive pixel offset samples farther right in the normalized band.
+        # In an already encoded grid, that corresponds to rolling left.
+        return -magnitude
+
+    def _roll_iris_code_offsets(self, bits, mask_bits, iris_shape, offsets):
+        offsets = np.asarray(offsets, dtype=np.int64)
+        rolled_bits = []
+        rolled_masks = []
+        cursor = 0
+        iris_h, iris_w = iris_shape
+
+        for filter_settings in self._filter_settings:
+            x_stride, y_stride = filter_settings["stride"]
+            num_x = iris_w // x_stride
+            num_y = iris_h // y_stride
+            section_len = num_x * num_y * 2
+            bit_grid = bits[cursor:cursor + section_len].reshape(num_x, num_y, 2)
+            mask_grid = mask_bits[cursor:cursor + section_len].reshape(num_x, num_y, 2)
+            cursor += section_len
+
+            filter_bits = []
+            filter_masks = []
+            for offset in offsets:
+                shift = self._pixel_offset_to_grid_shift(offset, x_stride)
+                filter_bits.append(np.roll(bit_grid, shift=shift, axis=0).reshape(-1))
+                filter_masks.append(np.roll(mask_grid, shift=shift, axis=0).reshape(-1))
+            rolled_bits.append(np.stack(filter_bits, axis=0))
+            rolled_masks.append(np.stack(filter_masks, axis=0))
+
+        return np.concatenate(rolled_bits, axis=1), np.concatenate(rolled_masks, axis=1)
     
-    def compare_iris_code_and_iris(self, iris, iris_code, iris_mask, iris_code_mask, rotation=None, offset=0):
+    def compare_iris_code_and_iris(
+        self,
+        iris,
+        iris_code,
+        iris_mask,
+        iris_code_mask,
+        rotation=None,
+        offset=0,
+        rotation_method="recompute",
+    ):
         if rotation is None:
             bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=offset)
             return (hamming_distance(bits, iris_code, mask, iris_code_mask), 0)
         offsets = np.arange(rotation) - rotation // 2
-        bits, masks, _ = self.get_iris_codes(iris, iris_mask, offsets=offsets)
+        if rotation_method == "recompute":
+            bits, masks, _ = self.get_iris_codes(iris, iris_mask, offsets=offsets)
+        elif rotation_method == "roll":
+            bits, mask, _ = self.get_iris_code(iris, iris_mask, offset=0)
+            bits, masks = self._roll_iris_code_offsets(bits, mask, iris.shape, offsets)
+        else:
+            raise ValueError(f"Unknown rotation method: {rotation_method}")
         scores = hamming_distances(bits, iris_code, masks, iris_code_mask)
         return (np.min(scores), np.argmin(scores)-rotation//2)

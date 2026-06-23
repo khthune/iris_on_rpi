@@ -401,12 +401,6 @@ def radial_band_overlay_original(raw_image, classifier, bands, alpha=0.35, disca
     iris_mask = clean_component_mask(iris_mask)
     pupil_mask = clean_component_mask(pupil_mask)
     eyelash_mask = clean_component_mask(eyelash_mask, kernel_size=3)
-    if np.any(eyelash_mask):
-        eyelash_mask = cv.dilate(
-            eyelash_mask,
-            cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)),
-            iterations=1,
-        )
 
     valid_source_mask = build_valid_source_mask(
         iris_mask,

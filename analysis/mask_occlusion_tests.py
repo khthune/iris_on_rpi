@@ -61,12 +61,6 @@ def get_source_debug(image):
     iris_mask = clean_component_mask(iris_mask)
     pupil_mask = clean_component_mask(pupil_mask)
     eyelash_mask = clean_component_mask(eyelash_mask, kernel_size=3)
-    if np.any(eyelash_mask):
-        eyelash_mask = cv.dilate(
-            eyelash_mask,
-            cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)),
-            iterations=1,
-        )
     valid_mask = build_valid_source_mask(
         iris_mask,
         pupil_mask,
@@ -390,7 +384,6 @@ def build_parser():
     single.add_argument("--iterations", type=int, default=1, help="Number of dilation iterations.")
     single.add_argument(
         "--output-name",
-        "--output-label",
         dest="output_name",
         default="mask_occlusion_overlay",
         help="Filename label after the image stem, for example 'source_mask' -> S1129R05_source_mask.png.",
@@ -412,7 +405,8 @@ def build_parser():
         help="Path to the dataset directory. If omitted, a known default path is used.",
     )
     multiple.add_argument(
-        "--dataset-format",
+        "--dataset",
+        dest="dataset_format",
         default="casia-v3-interval",
         choices=DATASET_CHOICES,
         help="Dataset folder layout to load.",
@@ -431,7 +425,6 @@ def build_parser():
     multiple.add_argument("--seed", type=int, default=0, help="Random seed for deterministic sampling.")
     multiple.add_argument(
         "--output-name",
-        "--output-label",
         dest="output_name",
         default="mask_occlusion_overlay",
         help="Filename label after each image stem, for example 'source_mask' -> S1129R05_source_mask.png.",

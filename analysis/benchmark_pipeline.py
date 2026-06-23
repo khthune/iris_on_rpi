@@ -1,9 +1,11 @@
-from argparse import ArgumentParser
+from argparse import ArgumentParser, SUPPRESS
+from collections import Counter
 import csv
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import time
 
@@ -23,7 +25,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CONFIG_DIR))
 from dataset_loaders import DATASET_CHOICES, load_dataset, resolve_dataset, sample_dataset
 from filter_loader import load_filter_bank
 from iris import (
-    IrisClassifier,
+    IrisClassifier as CurrentIrisClassifier,
     UNET_BAND_SHAPE,
     UNET_ONNX_PATH,
     fit_boundary_from_mask,
@@ -34,7 +36,9 @@ from iris import (
 )
 from pairwise_iris_analysis import (
     MATCHER_IRISCODE,
+    best_score_against_rotations,
     compute_pairwise_scores_iriscode,
+    evaluate_fmr_threshold,
     evaluate_zero_false_accept_threshold,
     evaluate_scores,
     precompute_codes,
@@ -64,56 +68,56 @@ DEFAULT_PAIRWISE_CONFIGS = {
     },
     "casia-v3-interval": {
         "max_samples": None,
-        "max_identities": 250,
-        "max_images_per_identity": 2,
+        "max_identities": None,
+        "max_images_per_identity": None,
         "seed": 0,
     },
     "casia-v4-interval": {
         "max_samples": None,
-        "max_identities": 250,
-        "max_images_per_identity": 2,
+        "max_identities": None,
+        "max_images_per_identity": None,
         "seed": 0,
     },
     "casia-distance": {
         "max_samples": None,
-        "max_identities": 250,
-        "max_images_per_identity": 2,
+        "max_identities": None,
+        "max_images_per_identity": None,
         "seed": 0,
     },
     "casia-1000": {
         "max_samples": None,
-        "max_identities": 250,
-        "max_images_per_identity": 2,
+        "max_identities": None,
+        "max_images_per_identity": None,
         "seed": 0,
     },
     "casia-v3-lamp": {
         "max_samples": None,
-        "max_identities": 250,
-        "max_images_per_identity": 2,
+        "max_identities": None,
+        "max_images_per_identity": None,
         "seed": 0,
     },
     "casia-v3-twins": {
         "max_samples": None,
-        "max_identities": 200,
-        "max_images_per_identity": 2,
+        "max_identities": None,
+        "max_images_per_identity": None,
         "seed": 0,
     },
     "iitd": {
         "max_samples": None,
-        "max_identities": 224,
-        "max_images_per_identity": 2,
+        "max_identities": None,
+        "max_images_per_identity": None,
         "seed": 0,
     },
     "mmu": {
         "max_samples": None,
         "max_identities": None,
-        "max_images_per_identity": 2,
+        "max_images_per_identity": None,
         "seed": 0,
     },
     "mmu2": {
         "max_samples": None,
         "max_identities": None,
-        "max_images_per_identity": 2,
+        "max_images_per_identity": None,
         "seed": 0,
     },
 }
@@ -135,6 +139,16 @@ def format_result(value):
 
 def env_flag(name):
     return os.environ.get(name, "").strip().lower() in TRUE_ENV_VALUES
+
+
+def load_iris_classifier_class(iris_engine):
+    if iris_engine == "current":
+        return CurrentIrisClassifier
+    if iris_engine == "legacy":
+        from legacy_iris import IrisClassifier as LegacyIrisClassifier
+
+        return LegacyIrisClassifier
+    raise ValueError(f"Unknown iris engine: {iris_engine}")
 
 
 def load_rotation_consistency_classifier():
@@ -170,6 +184,21 @@ def segment_image(image):
         return get_iris_band(image)
     except Exception:
         return None, None
+
+
+def build_wahet_band_getter():
+    local_wahet = ANALYSIS_ROOT / "wahet"
+    wahet_executable = local_wahet if local_wahet.exists() else shutil.which("wahet")
+    if wahet_executable is None:
+        raise FileNotFoundError(
+            f"--segmenter wahet requested, but WAHET was not found at {local_wahet} or in PATH."
+        )
+    from legacy_iris import get_iris_band as get_wahet_iris_band
+
+    def get_wahet_band(image, _image_name):
+        return get_wahet_iris_band(image, wahet_executable=wahet_executable)
+
+    return get_wahet_band
 
 
 def load_gt_manifest(dataset_format, manifest_root=DEFAULT_GT_MANIFEST_ROOT):
@@ -361,8 +390,8 @@ def filter_samples_by_available_names(images, labels, image_names, available_ima
     )
 
 
-def compute_iriscode_bit_count(selected_filters):
-    classifier = IrisClassifier(selected_filters)
+def compute_iriscode_bit_count(selected_filters, classifier_class=CurrentIrisClassifier):
+    classifier = classifier_class(selected_filters)
     dummy_band = np.zeros(UNET_BAND_SHAPE, dtype=np.float32)
     dummy_mask = np.ones(UNET_BAND_SHAPE, dtype=bool)
     iris_code, _mask_code, _filter_ids = classifier.get_iris_code(dummy_band, dummy_mask)
@@ -394,6 +423,105 @@ def evaluate_fixed_hd_threshold(same_class, scores, threshold):
     }
 
 
+def compute_gallery_probe_scores(
+    labels,
+    base_codes,
+    base_masks,
+    rotated_codes,
+    rotated_masks,
+    offsets,
+    min_valid_bits=None,
+):
+    label_to_indices = {}
+    for index, label in enumerate(labels):
+        label_to_indices.setdefault(label, []).append(index)
+
+    gallery_indices = []
+    probe_indices = []
+    for _label, indices in label_to_indices.items():
+        if len(indices) < 2:
+            continue
+        gallery_indices.append(indices[0])
+        probe_indices.extend(indices[1:])
+
+    if not gallery_indices:
+        raise RuntimeError(
+            "Probe test requires at least two successfully encoded images for at least one identity."
+        )
+    if not probe_indices:
+        raise RuntimeError("Probe test has no probe images after selecting gallery images.")
+
+    probe_list = []
+    gallery_list = []
+    score_list = []
+    same_class_list = []
+    best_offset_list = []
+    valid_bits_list = []
+    skipped_low_valid_bits = 0
+
+    comparison_count = len(probe_indices) * len(gallery_indices)
+    started = time.perf_counter()
+    comparison_index = 0
+    for probe_index in probe_indices:
+        for gallery_index in gallery_indices:
+            comparison_index += 1
+            score, offset_index, valid_bits = best_score_against_rotations(
+                base_codes[gallery_index],
+                base_masks[gallery_index],
+                rotated_codes[probe_index],
+                rotated_masks[probe_index],
+            )
+            if min_valid_bits is not None and valid_bits < min_valid_bits:
+                skipped_low_valid_bits += 1
+                if comparison_index == 1 or comparison_index % 25000 == 0 or comparison_index == comparison_count:
+                    elapsed = time.perf_counter() - started
+                    print(
+                        f"Scored probe comparisons: {comparison_index}/{comparison_count} in {elapsed:.1f}s "
+                        f"(skipped low valid bits: {skipped_low_valid_bits})"
+                    )
+                continue
+
+            probe_list.append(probe_index)
+            gallery_list.append(gallery_index)
+            score_list.append(score)
+            same_class_list.append(labels[probe_index] == labels[gallery_index])
+            best_offset_list.append(int(offsets[offset_index]))
+            valid_bits_list.append(valid_bits)
+
+            if comparison_index == 1 or comparison_index % 25000 == 0 or comparison_index == comparison_count:
+                elapsed = time.perf_counter() - started
+                suffix = ""
+                if min_valid_bits is not None:
+                    suffix = f" (skipped low valid bits: {skipped_low_valid_bits})"
+                print(f"Scored probe comparisons: {comparison_index}/{comparison_count} in {elapsed:.1f}s{suffix}")
+
+    same_class = np.array(same_class_list, dtype=bool)
+    return {
+        "probe_idx": np.array(probe_list, dtype=np.int32),
+        "gallery_idx": np.array(gallery_list, dtype=np.int32),
+        "scores": np.array(score_list, dtype=np.float32),
+        "same_class": same_class,
+        "best_offsets": np.array(best_offset_list, dtype=np.int16),
+        "valid_bits": np.array(valid_bits_list, dtype=np.int32),
+        "skipped_low_valid_bits": int(skipped_low_valid_bits),
+        "total_candidate_pairs": int(comparison_count),
+        "gallery_count": int(len(gallery_indices)),
+        "probe_count": int(len(probe_indices)),
+        "mated_pairs": int(np.sum(same_class)),
+        "non_mated_pairs": int(np.sum(~same_class)),
+    }
+
+
+def summarize_skipped_samples(skipped):
+    reason_counts = Counter()
+    for _index, _name, reason in skipped:
+        reason_text = str(reason)
+        if reason_text.startswith("valid iriscode bits "):
+            reason_text = "min_valid_pixels"
+        reason_counts[reason_text] += 1
+    return {reason: int(count) for reason, count in sorted(reason_counts.items())}
+
+
 def run_pairwise_benchmark(
     dataset_path,
     dataset_format,
@@ -410,11 +538,16 @@ def run_pairwise_benchmark(
     rotation_consistency_score="hd",
     rotation_consistency_match_parts=None,
     fixed_threshold=None,
+    target_fprs=None,
+    iris_engine="current",
+    test_protocol="pairwise",
+    rotation_method="recompute",
+    min_valid_pixels=None,
     max_identities=None,
     max_images_per_identity=None,
     seed=None,
     band_getter=None,
-    segmentation_source="onnx",
+    segmentation_source="unet",
     ):
     config = dict(DEFAULT_PAIRWISE_CONFIGS[dataset_format])
     if max_identities is not None:
@@ -440,7 +573,8 @@ def run_pairwise_benchmark(
         seed=config["seed"],
     )
 
-    classifier = IrisClassifier(selected_filters)
+    classifier_class = load_iris_classifier_class(iris_engine)
+    classifier = classifier_class(selected_filters)
     (
         base_codes,
         base_masks,
@@ -458,16 +592,52 @@ def run_pairwise_benchmark(
         rotation,
         band_getter=band_getter,
         offsets=rotation_offsets,
+        rotation_method=rotation_method,
     )
     summary = summarize_label_pairs(kept_labels)
-    pairwise = compute_pairwise_scores_iriscode(
-        kept_labels,
-        base_codes,
-        base_masks,
-        rotated_codes,
-        rotated_masks,
-        offsets,
-    )
+    if test_protocol == "pairwise":
+        pairwise = compute_pairwise_scores_iriscode(
+            kept_labels,
+            base_codes,
+            base_masks,
+            rotated_codes,
+            rotated_masks,
+            offsets,
+            min_valid_bits=min_valid_pixels,
+        )
+        protocol_summary = {
+            "name": "pairwise",
+            "mated_pairs": int(np.sum(pairwise["same_class"])),
+            "non_mated_pairs": int(np.sum(~pairwise["same_class"])),
+            "skipped_low_valid_bits": int(pairwise["skipped_low_valid_bits"]),
+            "total_candidate_pairs": int(pairwise["total_candidate_pairs"]),
+        }
+    elif test_protocol == "probe":
+        pairwise = compute_gallery_probe_scores(
+            kept_labels,
+            base_codes,
+            base_masks,
+            rotated_codes,
+            rotated_masks,
+            offsets,
+            min_valid_bits=min_valid_pixels,
+        )
+        protocol_summary = {
+            "name": "probe",
+            "gallery_count": pairwise["gallery_count"],
+            "probe_count": pairwise["probe_count"],
+            "mated_pairs": pairwise["mated_pairs"],
+            "non_mated_pairs": pairwise["non_mated_pairs"],
+            "skipped_low_valid_bits": int(pairwise["skipped_low_valid_bits"]),
+            "total_candidate_pairs": int(pairwise["total_candidate_pairs"]),
+        }
+    else:
+        raise ValueError(f"Unknown test protocol: {test_protocol}")
+    if pairwise["scores"].size == 0 or np.unique(pairwise["same_class"]).size < 2:
+        raise RuntimeError(
+            "--min-valid-pixels removed too many comparisons; the remaining comparisons do not contain both "
+            "mated and non-mated pairs."
+        )
     feature_extractor = "gabor"
     evaluation = evaluate_scores(pairwise["same_class"], pairwise["scores"])
     zero_false_accept = evaluate_zero_false_accept_threshold(
@@ -482,6 +652,20 @@ def run_pairwise_benchmark(
             pairwise["scores"],
             fixed_threshold,
         )
+    target_fpr_results = []
+    for target_fpr in target_fprs or []:
+        target_result = evaluate_fmr_threshold(
+            pairwise["same_class"],
+            pairwise["scores"],
+            target_fpr,
+            lower_is_mated=True,
+        )
+        target_result["tpr"] = (
+            None
+            if target_result["fnmr"] is None
+            else float(1.0 - target_result["fnmr"])
+        )
+        target_fpr_results.append(target_result)
     rotation_consistency_result = None
     if include_rotation_consistency:
         (
@@ -590,8 +774,15 @@ def run_pairwise_benchmark(
         "segmentation_backend": get_segmentation_backend_name(),
         "segmentation_model_path": str(UNET_ONNX_PATH),
         "segmentation_source": segmentation_source,
+        "iris_engine": iris_engine,
+        "test_protocol": test_protocol,
+        "rotation_method": rotation_method,
+        "min_valid_pixels": (
+            None if min_valid_pixels is None else int(min_valid_pixels)
+        ),
         "dataset_path": str(dataset_path),
         "sample_summary": summary,
+        "protocol_summary": protocol_summary,
         "sampling": config,
         "rotation": int(rotation),
         "rotation_step": (
@@ -602,6 +793,7 @@ def run_pairwise_benchmark(
         "rotation_offsets": [int(offset) for offset in offsets],
         "kept_sample_count": int(len(kept_labels)),
         "skipped_sample_count": int(len(skipped)),
+        "skipped_sample_reasons": summarize_skipped_samples(skipped),
         "eer": float(evaluation["eer"]),
         "eer_std": float(evaluation["eer_std"]),
         "eer_fpr": float(evaluation["eer_fpr"]),
@@ -611,6 +803,7 @@ def run_pairwise_benchmark(
         "roc_auc": float(evaluation["roc_auc"]),
         "zero_false_accept": zero_false_accept,
         "fixed_threshold": fixed_threshold_result,
+        "target_fpr": target_fpr_results,
         "rotation_consistency_classifier": rotation_consistency_result,
     }
 
@@ -622,7 +815,8 @@ def main():
         )
     )
     parser.add_argument(
-        "--datasets",
+        "--dataset",
+        dest="datasets",
         nargs="+",
         default=[
             "casia-v1",
@@ -635,9 +829,31 @@ def main():
             "mmu2",
         ],
         choices=[dataset for dataset in DATASET_CHOICES if dataset != "auto"],
-        help="Datasets to include in the evaluation.",
+        help="Dataset or datasets to include in the evaluation.",
+    )
+    parser.add_argument(
+        "--datasets",
+        dest="datasets",
+        nargs="+",
+        choices=[dataset for dataset in DATASET_CHOICES if dataset != "auto"],
+        help=SUPPRESS,
     )
     parser.add_argument("--rotation", type=int, default=21, help="Rotation count used for scoring.")
+    parser.add_argument(
+        "--test",
+        choices=["pairwise", "probe"],
+        default="pairwise",
+        help=(
+            "Evaluation protocol. 'pairwise' compares all sampled pairs. "
+            "'probe' enrolls one gallery image per identity and tests the remaining images as probes."
+        ),
+    )
+    parser.add_argument(
+        "--segmenter",
+        choices=["unet", "wahet"],
+        default="unet",
+        help="Segmentation/normalization method to use unless --gt-mask is enabled.",
+    )
     parser.add_argument(
         "--rotation-step",
         type=int,
@@ -648,11 +864,20 @@ def main():
         ),
     )
     parser.add_argument(
+        "--rotation-method",
+        choices=["recompute", "roll"],
+        default="recompute",
+        help=(
+            "How to evaluate rotation offsets. 'recompute' re-encodes each offset before scoring. "
+            "'roll' encodes once and circularly rolls iriscode bits/masks per filter grid."
+        ),
+    )
+    parser.add_argument(
         "--gt-mask",
         dest="gtmask",
         action="store_true",
         help=(
-            "Use ground-truth binary masks from analysis/output/gt_manifests instead of the ONNX segmenter. "
+            "Use ground-truth binary masks from analysis/output/gt_manifests instead of the U-Net segmenter. "
             "Fails if any selected dataset has no GT manifest."
         ),
     )
@@ -673,6 +898,25 @@ def main():
         help=(
             "Also evaluate the normal pairwise HD benchmark at this fixed threshold. "
             "Mated is predicted when HD <= threshold."
+        ),
+    )
+    parser.add_argument(
+        "--target-fpr",
+        type=float,
+        nargs="*",
+        default=[],
+        help=(
+            "Report TPR at these target false positive rates/FMR values. "
+            "Use decimal values: 0.001 is 0.1%% and 0.0001 is 0.01%%."
+        ),
+    )
+    parser.add_argument(
+        "--min-valid-pixels",
+        type=int,
+        default=None,
+        help=(
+            "Skip comparisons whose overlapping iriscode masks contain fewer than this many valid bits. "
+            "A bit is valid only when both compared iriscodes are valid at that location after rotation."
         ),
     )
     parser.add_argument(
@@ -724,6 +968,15 @@ def main():
         help="Optional Python filters file containing a 'filters' list. Defaults to project filters.py.",
     )
     parser.add_argument(
+        "--iris-engine",
+        choices=["current", "legacy"],
+        default="current",
+        help=(
+            "Recognition engine to use. 'current' uses iris.py. "
+            "'legacy' uses legacy_iris.py recreated from the first repo commit."
+        ),
+    )
+    parser.add_argument(
         "--output-name",
         default="benchmark_results.json",
         help="Filename for the JSON results inside the default output directory, or an absolute JSON path.",
@@ -768,6 +1021,15 @@ def main():
         raise ValueError("--max-id must be at least 1")
     if args.max_images_per_identity is not None and args.max_images_per_identity < 1:
         raise ValueError("--max-img-per-id must be at least 1")
+    if args.test == "probe" and args.max_images_per_identity == 1:
+        raise ValueError("--test probe needs at least two images per identity; do not use --max-img-per-id 1")
+    if args.gtmask and args.segmenter != "unet":
+        raise ValueError("--gt-mask cannot be combined with --segmenter; GT masks replace the segmenter.")
+    for target_fpr in args.target_fpr:
+        if target_fpr < 0.0 or target_fpr > 1.0:
+            raise ValueError("--target-fpr values must be between 0 and 1")
+    if args.min_valid_pixels is not None and args.min_valid_pixels < 0:
+        raise ValueError("--min-valid-pixels cannot be negative")
     include_rotation_consistency_classifier = (
         env_flag("ROTATION_CONSISTENCY_CLASSIFIER")
         or args.rotation_consistency_parts is not None
@@ -775,6 +1037,8 @@ def main():
         or args.rotation_consistency_tolerance_offset is not None
         or args.rotation_consistency_match_parts is not None
     )
+    if args.test == "probe" and include_rotation_consistency_classifier:
+        raise ValueError("--test probe is not supported with --parts, --score, --match-parts, or ROTATION_CONSISTENCY_CLASSIFIER")
     gt_manifest_root = Path(args.gt_manifest_root).expanduser().resolve()
     gt_annotation_root = Path(args.gt_annotation_root).expanduser().resolve()
     gt_manifest_paths = {}
@@ -801,19 +1065,30 @@ def main():
         output_path = output_dir / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_filters, filters_source = load_filter_bank(args.filters)
-    iriscode_bits = compute_iriscode_bit_count(selected_filters)
+    iris_classifier_class = load_iris_classifier_class(args.iris_engine)
+    if args.rotation_method == "roll" and args.iris_engine != "current":
+        raise ValueError("--rotation-method roll is only available with --iris-engine current.")
+    iriscode_bits = compute_iriscode_bit_count(selected_filters, iris_classifier_class)
     print(f"Filters in use: {len(selected_filters)}")
     print(f"Filters source: {filters_source}")
+    print(f"Iris engine: {args.iris_engine}")
+    print(f"Rotation method: {args.rotation_method}")
     print(f"Total iriscode bits from filters: {iriscode_bits}")
     results = {
         "filters_count": int(len(selected_filters)),
         "filters_source": filters_source,
+        "iris_engine": args.iris_engine,
         "iriscode_bits": iriscode_bits,
         "matcher": MATCHER_IRISCODE,
         "feature_extractor": "gabor",
         "segmentation_backend": get_segmentation_backend_name(),
         "segmentation_model_path": str(UNET_ONNX_PATH),
-        "segmentation_source": "gtmask" if args.gtmask else "onnx",
+        "segmentation_source": "gtmask" if args.gtmask else args.segmenter,
+        "test_protocol": args.test,
+        "rotation_method": args.rotation_method,
+        "min_valid_pixels": (
+            None if args.min_valid_pixels is None else int(args.min_valid_pixels)
+        ),
         "gtmask": {
             "enabled": bool(args.gtmask),
             "manifest_root": str(gt_manifest_root) if args.gtmask else None,
@@ -856,7 +1131,9 @@ def main():
         dataset_path, dataset_format = resolve_dataset(None, dataset_format)
         print(f"Evaluating dataset: {dataset_format}")
         band_getter = None
-        segmentation_source = "onnx"
+        segmentation_source = args.segmenter
+        if args.segmenter == "wahet":
+            band_getter = build_wahet_band_getter()
         if args.gtmask:
             manifest_path, band_getter = build_gt_band_getter(
                 dataset_format,
@@ -881,6 +1158,11 @@ def main():
             rotation_consistency_score=rotation_consistency_score,
             rotation_consistency_match_parts=args.rotation_consistency_match_parts,
             fixed_threshold=args.threshold,
+            target_fprs=args.target_fpr,
+            iris_engine=args.iris_engine,
+            test_protocol=args.test,
+            rotation_method=args.rotation_method,
+            min_valid_pixels=args.min_valid_pixels,
             max_identities=args.max_identities,
             max_images_per_identity=args.max_images_per_identity,
             seed=args.seed,
@@ -888,7 +1170,22 @@ def main():
             segmentation_source=segmentation_source,
         )
         results["pairwise"].append(pairwise_result)
-        print(f"  pairwise: AUC={pairwise_result['roc_auc']:.4f} EER={pairwise_result['eer']:.4f}")
+        print(
+            f"  {pairwise_result['test_protocol']}: "
+            f"AUC={pairwise_result['roc_auc']:.4f} EER={pairwise_result['eer']:.4f}"
+        )
+        if pairwise_result["skipped_sample_count"]:
+            print(
+                f"  skipped samples: {pairwise_result['skipped_sample_count']} "
+                f"{pairwise_result['skipped_sample_reasons']}"
+            )
+        skipped_low_valid = pairwise_result["protocol_summary"].get("skipped_low_valid_bits", 0)
+        if skipped_low_valid:
+            total_candidate_pairs = pairwise_result["protocol_summary"].get("total_candidate_pairs")
+            print(
+                f"  skipped comparisons below min valid bits: "
+                f"{skipped_low_valid}/{total_candidate_pairs}"
+            )
         fixed_threshold = pairwise_result["fixed_threshold"]
         if fixed_threshold is not None:
             print(
@@ -901,6 +1198,26 @@ def main():
                 f"{fixed_threshold['non_mated_wrongly_classified_mated']}/{fixed_threshold['non_mated_total']} "
                 f"rate={fixed_threshold['false_accept_rate']:.4f}; "
                 f"TPR={fixed_threshold['tpr']:.4f}"
+            )
+        for target_fpr in pairwise_result["target_fpr"]:
+            threshold = target_fpr["threshold"]
+            if threshold is None:
+                print(
+                    "  target FPR/FMR: "
+                    f"target={target_fpr['target_fmr']:.6f} "
+                    "could not be evaluated because mated or non-mated pairs are missing"
+                )
+                continue
+            print(
+                "  target FPR/FMR: "
+                f"target={target_fpr['target_fmr']:.6f} "
+                f"({target_fpr['target_fmr'] * 100:.4f}%) "
+                f"HD threshold={threshold:.6f} "
+                f"actual FPR/FMR={target_fpr['actual_fmr']:.8f} "
+                f"TPR={target_fpr['tpr']:.4f} "
+                f"FNMR/FNR={target_fpr['fnmr']:.4f} "
+                f"({target_fpr['mated_accepted']}/{target_fpr['mated_total']} mated accepted, "
+                f"{target_fpr['non_mated_accepted']}/{target_fpr['non_mated_total']} non-mated accepted)"
             )
         rotation_result = pairwise_result["rotation_consistency_classifier"]
         if rotation_result is not None:

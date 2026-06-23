@@ -344,7 +344,7 @@ def resolve_dataset(dataset_path, dataset_format):
                     return resolved_path, "mmu2"
             raise FileNotFoundError(
                 f"Could not infer dataset format from '{resolved_path}'. "
-                "Use --dataset-format explicitly."
+                "Use --dataset explicitly."
             )
 
         return resolved_path, dataset_format

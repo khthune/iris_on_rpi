@@ -3,6 +3,7 @@
 from argparse import ArgumentParser
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
@@ -26,7 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from filter_loader import load_filter_bank
-from iris import IrisClassifier, get_iris_band, hamming_distance, hamming_distances
+from iris import IrisClassifier as CurrentIrisClassifier, get_iris_band, hamming_distance, hamming_distances
 from pairwise_iris_analysis import (
     MATCHER_IRISCODE,
 )
@@ -56,6 +57,124 @@ def segment_image(image):
     return iris_band, iris_mask
 
 
+class StepProfile:
+    def __init__(self):
+        self.times = {}
+
+    def add(self, name, elapsed):
+        self.times.setdefault(name, []).append(float(elapsed))
+
+    def print_summary(self):
+        if not self.times:
+            return
+        totals = {
+            name: float(np.asarray(times, dtype=np.float64).sum())
+            for name, times in self.times.items()
+        }
+        grand_total = sum(totals.values())
+        print("Pipeline step timing")
+        for name in sorted(self.times, key=lambda item: totals[item], reverse=True):
+            times = np.asarray(self.times[name], dtype=np.float64)
+            mean = float(times.mean())
+            std = float(times.std(ddof=1)) if times.size > 1 else 0.0
+            total = totals[name]
+            percent = 0.0 if grand_total == 0.0 else total / grand_total * 100.0
+            print(
+                f"  {name}: mean={mean:.8f} s std={std:.8f} s "
+                f"total={total:.8f} s calls={times.size} share={percent:.1f}%"
+            )
+
+
+def record_step(profile, name, start):
+    if profile is not None:
+        profile.add(name, time.perf_counter() - start)
+
+
+def timed_segment(image, segmenter, profile=None, step_name="segmentation"):
+    start = time.perf_counter()
+    iris_band, iris_mask = segmenter(image)
+    record_step(profile, step_name, start)
+    return iris_band, iris_mask
+
+
+def timed_encode(classifier, iris_band, iris_mask, profile=None, step_name="encoding"):
+    start = time.perf_counter()
+    result = classifier.get_iris_code(iris_band, iris_mask)
+    record_step(profile, step_name, start)
+    return result
+
+
+def timed_encode_offsets(classifier, iris_band, iris_mask, offsets, profile=None, step_name="encoding_offsets"):
+    start = time.perf_counter()
+    result = classifier.get_iris_codes(iris_band, iris_mask, offsets=offsets)
+    record_step(profile, step_name, start)
+    return result
+
+
+def timed_rotation_codes(classifier, iris_band, iris_mask, offsets, rotation_method, profile=None, step_name="rotation_codes"):
+    if rotation_method == "recompute":
+        return timed_encode_offsets(
+            classifier,
+            iris_band,
+            iris_mask,
+            offsets,
+            profile,
+            f"{step_name}.recompute",
+        )
+    if rotation_method == "roll":
+        if not hasattr(classifier, "_roll_iris_code_offsets"):
+            raise ValueError("--rotation-method roll is only available for the current iris engine.")
+        base_code, base_mask, filter_ids = timed_encode(
+            classifier,
+            iris_band,
+            iris_mask,
+            profile,
+            f"{step_name}.base_encoding",
+        )
+        start = time.perf_counter()
+        rolled_codes, rolled_masks = classifier._roll_iris_code_offsets(
+            np.asarray(base_code, dtype=bool),
+            np.asarray(base_mask, dtype=bool),
+            iris_band.shape,
+            offsets,
+        )
+        record_step(profile, f"{step_name}.roll_offsets", start)
+        return rolled_codes, rolled_masks, np.broadcast_to(filter_ids, rolled_codes.shape)
+    raise ValueError(f"Unknown rotation method: {rotation_method}")
+
+
+def build_segmenter(segmenter):
+    if segmenter == "unet":
+        return segment_image
+    if segmenter == "wahet":
+        local_wahet = Path(__file__).resolve().parent / "wahet"
+        wahet_executable = local_wahet if local_wahet.exists() else shutil.which("wahet")
+        if wahet_executable is None:
+            raise FileNotFoundError(
+                f"--segmenter wahet requested, but WAHET was not found at {local_wahet} or in PATH."
+            )
+        from legacy_iris import get_iris_band as get_wahet_iris_band
+
+        def segment_with_wahet(image):
+            iris_band, iris_mask = get_wahet_iris_band(image, wahet_executable=wahet_executable)
+            if iris_band is None or iris_mask is None:
+                raise RuntimeError("WAHET iris segmentation failed.")
+            return iris_band, iris_mask
+
+        return segment_with_wahet
+    raise ValueError(f"Unknown segmenter: {segmenter}")
+
+
+def load_iris_classifier_class(iris_engine):
+    if iris_engine == "current":
+        return CurrentIrisClassifier
+    if iris_engine == "legacy":
+        from legacy_iris import IrisClassifier as LegacyIrisClassifier
+
+        return LegacyIrisClassifier
+    raise ValueError(f"Unknown iris engine: {iris_engine}")
+
+
 def benchmark(name, runs, func):
     times = np.empty(runs, dtype=np.float64)
     result = None
@@ -67,6 +186,7 @@ def benchmark(name, runs, func):
     print(name)
     print(f"  runs: {runs}")
     print(f"  mean: {times.mean():.8f} s")
+    print(f"  std: {times.std(ddof=1) if runs > 1 else 0.0:.8f} s")
     print(f"  median: {np.median(times):.8f} s")
     print(f"  min: {times.min():.8f} s")
     print(f"  max: {times.max():.8f} s")
@@ -75,6 +195,7 @@ def benchmark(name, runs, func):
         "name": name,
         "runs": runs,
         "mean": float(times.mean()),
+        "std": float(times.std(ddof=1)) if runs > 1 else 0.0,
         "median": float(np.median(times)),
         "min": float(times.min()),
         "max": float(times.max()),
@@ -92,11 +213,11 @@ def format_result(result):
     return result
 
 
-def build_database(classifier, image_paths):
+def build_database(classifier, image_paths, segmenter):
     codes = []
     for image_path in image_paths:
         image = load_image(image_path)
-        iris_band, iris_mask = segment_image(image)
+        iris_band, iris_mask = segmenter(image)
         iris_code, mask_code, _ = classifier.get_iris_code(iris_band, iris_mask)
         codes.append(
             np.stack(
@@ -110,9 +231,9 @@ def build_database(classifier, image_paths):
     return np.stack(codes, axis=1)
 
 
-def enroll_operation(classifier, image):
-    iris_band, iris_mask = segment_image(image)
-    iris_code, mask_code, _ = classifier.get_iris_code(iris_band, iris_mask)
+def enroll_operation(classifier, image, segmenter, profile=None):
+    iris_band, iris_mask = timed_segment(image, segmenter, profile, "enroll.segmentation")
+    iris_code, mask_code, _ = timed_encode(classifier, iris_band, iris_mask, profile, "enroll.encoding")
     code = np.stack(
         (
             np.asarray(iris_code, dtype=bool),
@@ -140,13 +261,29 @@ def rotation_offsets(rotation, rotation_step=1):
     return stepped_offsets
 
 
-def compare_iris_code_parts(classifier, iris_band, iris_mask, stored_code, stored_mask, offsets, parts):
-    iris_codes, mask_codes, _ = classifier.get_iris_codes(
+def compare_iris_code_parts(
+    classifier,
+    iris_band,
+    iris_mask,
+    stored_code,
+    stored_mask,
+    offsets,
+    parts,
+    rotation_method,
+    profile=None,
+    prefix="parts",
+):
+    iris_codes, mask_codes, _ = timed_rotation_codes(
+        classifier,
         iris_band,
         iris_mask,
-        offsets=offsets,
+        offsets,
+        rotation_method,
+        profile,
+        f"{prefix}.rotation_codes",
     )
     slices = split_code_slices(stored_code.shape[0], parts)
+    start = time.perf_counter()
     part_scores, part_offsets = part_scores_for_offsets(
         stored_code,
         stored_mask,
@@ -157,13 +294,15 @@ def compare_iris_code_parts(classifier, iris_band, iris_mask, stored_code, store
         min_valid_bits=1,
     )
     selected = select_parts(part_scores, part_offsets, eliminate=0)
+    record_step(profile, f"{prefix}.part_scoring", start)
     return selected["avg_hd"], selected["anchor_offset"]
 
 
-def compare_iris_code_operation(classifier, image, stored_code, offsets, parts=None):
-    iris_band, iris_mask = segment_image(image)
+def compare_iris_code_operation(classifier, image, stored_code, offsets, segmenter, parts=None, rotation_method="recompute", profile=None):
+    iris_band, iris_mask = timed_segment(image, segmenter, profile, "compare_template.segmentation")
     if parts is not None:
-        return compare_iris_code_parts(
+        start = time.perf_counter()
+        result = compare_iris_code_parts(
             classifier,
             iris_band,
             iris_mask,
@@ -171,21 +310,32 @@ def compare_iris_code_operation(classifier, image, stored_code, offsets, parts=N
             stored_code[1, 0],
             offsets,
             parts,
+            rotation_method,
+            profile,
+            "compare_template",
         )
-    iris_codes, mask_codes, _ = classifier.get_iris_codes(
+        record_step(profile, "compare_template.part_selection_total", start)
+        return result
+    iris_codes, mask_codes, _ = timed_rotation_codes(
+        classifier,
         iris_band,
         iris_mask,
-        offsets=offsets,
+        offsets,
+        rotation_method,
+        profile,
+        "compare_template.rotation_codes",
     )
+    start = time.perf_counter()
     scores = hamming_distances(iris_codes, stored_code[0, 0], mask_codes, stored_code[1, 0])
     best_index = int(np.argmin(scores))
+    record_step(profile, "compare_template.hamming_scoring", start)
     return float(scores[best_index]), int(offsets[best_index])
 
 
-def compare_image_operation(classifier, image1, image2, offsets, parts=None):
-    iris1, mask1 = segment_image(image1)
-    iris2, mask2 = segment_image(image2)
-    code1, code_mask1, _ = classifier.get_iris_code(iris1, mask1)
+def compare_image_operation(classifier, image1, image2, offsets, segmenter, parts=None, rotation_method="recompute", profile=None):
+    iris1, mask1 = timed_segment(image1, segmenter, profile, "compare_image.segmentation")
+    iris2, mask2 = timed_segment(image2, segmenter, profile, "compare_image.segmentation")
+    code1, code_mask1, _ = timed_encode(classifier, iris1, mask1, profile, "compare_image.template_encoding")
     if parts is not None:
         return compare_iris_code_parts(
             classifier,
@@ -195,23 +345,41 @@ def compare_image_operation(classifier, image1, image2, offsets, parts=None):
             np.asarray(code_mask1, dtype=bool),
             offsets,
             parts,
+            rotation_method,
+            profile,
+            "compare_image",
         )
-    iris_codes, mask_codes, _ = classifier.get_iris_codes(iris2, mask2, offsets=offsets)
+    iris_codes, mask_codes, _ = timed_rotation_codes(
+        classifier,
+        iris2,
+        mask2,
+        offsets,
+        rotation_method,
+        profile,
+        "compare_image.query_rotation_codes",
+    )
+    start = time.perf_counter()
     scores = hamming_distances(iris_codes, np.asarray(code1, dtype=bool), mask_codes, np.asarray(code_mask1, dtype=bool))
     best_index = int(np.argmin(scores))
+    record_step(profile, "compare_image.hamming_scoring", start)
     return float(scores[best_index]), int(offsets[best_index])
 
 
-def find_operation(classifier, query_image, codes, offsets, parts=None):
-    iris_band, iris_mask = segment_image(query_image)
-    iris_codes, mask_codes, _ = classifier.get_iris_codes(
+def find_operation(classifier, query_image, codes, offsets, segmenter, parts=None, rotation_method="recompute", profile=None):
+    iris_band, iris_mask = timed_segment(query_image, segmenter, profile, "find.segmentation")
+    iris_codes, mask_codes, _ = timed_rotation_codes(
+        classifier,
         iris_band,
         iris_mask,
-        offsets=offsets,
+        offsets,
+        rotation_method,
+        profile=profile,
+        step_name="find.rotation_codes",
     )
     slices = split_code_slices(codes.shape[2], parts) if parts is not None else None
     best_match = None
     best_score = float("inf")
+    start = time.perf_counter()
     for index in range(codes.shape[1]):
         if parts is None:
             curr_scores = [
@@ -239,6 +407,7 @@ def find_operation(classifier, query_image, codes, offsets, parts=None):
             best_score = curr_score
             best_match = index
 
+    record_step(profile, "find.database_scoring", start)
     return best_match, best_score
 
 
@@ -250,6 +419,7 @@ def plot_benchmark_results(results, output_name, title, metadata=None):
         "Find",
     ]
     means = [result["mean"] for result in results]
+    stds = [result["std"] for result in results]
 
     if output_name:
         output = Path(output_name).expanduser()
@@ -258,14 +428,23 @@ def plot_benchmark_results(results, output_name, title, metadata=None):
         output = output.resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         figure, axis = plt.subplots(figsize=(9, 5))
-        bars = axis.bar(labels, means, color="#7c8aa5")
+        bars = axis.bar(
+            labels,
+            means,
+            yerr=stds,
+            capsize=6,
+            color="#7c8aa5",
+            ecolor="#30343b",
+            linewidth=1,
+        )
         axis.set_title(title)
         axis.set_ylabel("Mean Time (seconds)")
-        axis.set_ylim(0, max(means) * 1.15 if means else 1.0)
-        for bar, mean in zip(bars, means):
+        upper = [mean + std for mean, std in zip(means, stds)]
+        axis.set_ylim(0, max(upper) * 1.18 if upper else 1.0)
+        for bar, mean, std in zip(bars, means, stds):
             axis.text(
                 bar.get_x() + bar.get_width() / 2,
-                bar.get_height(),
+                mean + std,
                 f"{mean:.2f}s",
                 ha="center",
                 va="bottom",
@@ -299,6 +478,15 @@ def main():
         help="Only test offsets divisible by this step. Example: --rotation 21 --rotation-step 4 tests -8,-4,0,4,8.",
     )
     parser.add_argument(
+        "--rotation-method",
+        choices=["recompute", "roll"],
+        default="recompute",
+        help=(
+            "How to evaluate rotation offsets. 'recompute' re-encodes each offset before scoring. "
+            "'roll' encodes once and circularly rolls iriscode bits/masks per filter grid."
+        ),
+    )
+    parser.add_argument(
         "--parts",
         type=int,
         default=None,
@@ -319,6 +507,21 @@ def main():
         default=None,
         help="Optional Python filters file containing a 'filters' list. Defaults to project filters.py.",
     )
+    parser.add_argument(
+        "--iris-engine",
+        choices=["current", "legacy"],
+        default="current",
+        help=(
+            "Recognition engine to use. 'current' uses iris.py. "
+            "'legacy' uses legacy_iris.py recreated from the first repo commit."
+        ),
+    )
+    parser.add_argument(
+        "--segmenter",
+        choices=["unet", "wahet"],
+        default="unet",
+        help="Segmentation/normalization method to use.",
+    )
     args = parser.parse_args()
 
     if args.runs < 1:
@@ -334,39 +537,76 @@ def main():
     compare_image = load_image(args.compare_image)
     database_images = args.database_images if args.database_images else [args.query_image, args.compare_image]
     selected_filters, filters_source = load_filter_bank(args.filters)
+    classifier_class = load_iris_classifier_class(args.iris_engine)
+    if args.rotation_method == "roll" and args.iris_engine != "current":
+        raise ValueError("--rotation-method roll is only available with --iris-engine current.")
+    segmenter = build_segmenter(args.segmenter)
     offsets = rotation_offsets(args.rotation, args.rotation_step)
 
     print(f"Filters in use: {len(selected_filters)}")
     print(f"Filters source: {filters_source}")
+    print(f"Iris engine: {args.iris_engine}")
+    print(f"Segmenter: {args.segmenter}")
+    print(f"Rotation method: {args.rotation_method}")
     print(f"Rotation offsets: {','.join(str(int(offset)) for offset in offsets)}")
-    classifier = IrisClassifier(selected_filters)
+    classifier = classifier_class(selected_filters)
     stored_database = build_database(
         classifier,
         database_images,
+        segmenter,
     )
     stored_template = stored_database[:, :1, :]
+    profile = StepProfile()
 
     results = []
     results.append(benchmark(
         "enroll",
         args.runs,
-        lambda: enroll_operation(classifier, query_image),
+        lambda: enroll_operation(classifier, query_image, segmenter, profile),
     ))
     results.append(benchmark(
         "compare_template",
         args.runs,
-        lambda: compare_iris_code_operation(classifier, query_image, stored_template, offsets, args.parts),
+        lambda: compare_iris_code_operation(
+            classifier,
+            query_image,
+            stored_template,
+            offsets,
+            segmenter,
+            args.parts,
+            args.rotation_method,
+            profile,
+        ),
     ))
     results.append(benchmark(
         "compare_image",
         args.runs,
-        lambda: compare_image_operation(classifier, query_image, compare_image, offsets, args.parts),
+        lambda: compare_image_operation(
+            classifier,
+            query_image,
+            compare_image,
+            offsets,
+            segmenter,
+            args.parts,
+            args.rotation_method,
+            profile,
+        ),
     ))
     results.append(benchmark(
         "find",
         args.runs,
-        lambda: find_operation(classifier, query_image, stored_database, offsets, args.parts),
+        lambda: find_operation(
+            classifier,
+            query_image,
+            stored_database,
+            offsets,
+            segmenter,
+            args.parts,
+            args.rotation_method,
+            profile,
+        ),
     ))
+    profile.print_summary()
 
     rotation_label = "No Rotation" if args.rotation <= 1 else f"Rotation {args.rotation}"
     if args.rotation_step > 1:
@@ -383,11 +623,13 @@ def main():
             "database_images": len(database_images),
             "rotation": args.rotation,
             "rotation_step": args.rotation_step,
+            "rotation_method": args.rotation_method,
             "rotation_offsets": ",".join(str(int(offset)) for offset in offsets),
             "parts": args.parts,
             "runs": args.runs,
             "matcher": MATCHER_IRISCODE,
-            "seg_path": os.environ.get("SEG_PATH"),
+            "iris_engine": args.iris_engine,
+            "segmenter": args.segmenter,
             "filter_count": len(selected_filters),
             "filters_source": filters_source,
             "output_name": args.output_name,
