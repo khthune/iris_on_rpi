@@ -34,6 +34,9 @@ from pairwise_iris_analysis import (
 from rotation_part_scoring import part_scores_for_offsets, select_parts, split_code_slices
 
 
+IMAGE_EXTENSIONS = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".pgm"}
+
+
 def add_figure_metadata(figure, metadata):
     if not metadata:
         return
@@ -229,6 +232,27 @@ def build_database(classifier, image_paths, segmenter):
             )
         )
     return np.stack(codes, axis=1)
+
+
+def collect_database_images(database_images, database_dir, database_size):
+    if database_images and database_dir:
+        raise ValueError("Use either --database-images or --database-dir, not both.")
+    if database_images:
+        paths = [Path(path).expanduser().resolve() for path in database_images]
+    elif database_dir:
+        root = Path(database_dir).expanduser().resolve()
+        paths = sorted(
+            path
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+    else:
+        raise ValueError("Provide --database-images or --database-dir so find can use real stored images.")
+    if len(paths) < database_size:
+        raise ValueError(
+            f"Find database needs {database_size} real images, but only found {len(paths)}."
+        )
+    return paths[:database_size]
 
 
 def enroll_operation(classifier, image, segmenter, profile=None):
@@ -466,6 +490,19 @@ def main():
         help="Images to enroll into an in-memory database for the find benchmark",
     )
     parser.add_argument(
+        "--database-dir",
+        help="Directory of real images to enroll into the in-memory database for the find benchmark.",
+    )
+    parser.add_argument(
+        "--database-size",
+        type=int,
+        default=100,
+        help=(
+            "Number of real stored iriscodes used by the find benchmark. "
+            "The script uses the first N images from --database-images or --database-dir."
+        ),
+    )
+    parser.add_argument(
         "--rotation",
         type=int,
         default=1,
@@ -530,12 +567,14 @@ def main():
         raise ValueError("--rotation must be at least 1")
     if args.rotation_step < 1:
         raise ValueError("--rotation-step must be at least 1")
+    if args.database_size < 1:
+        raise ValueError("--database-size must be at least 1")
     if args.parts is not None and args.parts < 1:
         raise ValueError("--parts must be at least 1")
 
     query_image = load_image(args.query_image)
     compare_image = load_image(args.compare_image)
-    database_images = args.database_images if args.database_images else [args.query_image, args.compare_image]
+    database_images = collect_database_images(args.database_images, args.database_dir, args.database_size)
     selected_filters, filters_source = load_filter_bank(args.filters)
     classifier_class = load_iris_classifier_class(args.iris_engine)
     if args.rotation_method == "roll" and args.iris_engine != "current":
@@ -557,6 +596,8 @@ def main():
     )
     stored_template = stored_database[:, :1, :]
     profile = StepProfile()
+    print(f"Find database source: {args.database_dir or 'explicit image list'}")
+    print(f"Find stored iriscodes: {stored_database.shape[1]}")
 
     results = []
     results.append(benchmark(
@@ -620,7 +661,8 @@ def main():
         metadata={
             "query_image": Path(args.query_image).name,
             "compare_image": Path(args.compare_image).name,
-            "database_images": len(database_images),
+            "database_source": args.database_dir or "explicit image list",
+            "database_size": stored_database.shape[1],
             "rotation": args.rotation,
             "rotation_step": args.rotation_step,
             "rotation_method": args.rotation_method,
